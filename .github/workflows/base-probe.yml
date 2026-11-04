@@ -183,6 +183,18 @@ jobs:
                 printf '\n# kernel %s：页大小 choice 不给答案会让 syncconfig 在非交互 CI 挂掉\nCONFIG_ARM64_4K_PAGES=y\n' "$KV" >> "$CFG"
                 echo "  已补 CONFIG_ARM64_4K_PAGES=y 到 config-$KV（4KB 是 arm64 默认）"
               fi
+              # 211 给 RTL8221B PHY 加 .probe，但 6.18 的 realtek_main.c 结构体与
+              # 6.12 不同，实测两个 hunk 全 FAILED。探针阶段先隔离它，让构建继续
+              # 暴露后面的补丁；隔离清单会打印，绝不悄悄丢补丁。
+              PD="$TDIR/patches-$KV"
+              HOLD="$WORK/disabled-patches-$KV"
+              mkdir -p "$HOLD"
+              for p in 211-realtek-rtl8221b-private-state.patch; do
+                if [ -f "$PD/$p" ]; then
+                  mv "$PD/$p" "$HOLD/$p"
+                  echo "  ⚠ 隔离 6.12 不兼容补丁 $p → $HOLD（探针结论必须算上这笔）"
+                fi
+              done
             fi
           fi
           echo "改后：$(grep -E '^KERNEL_PATCHVER' "$MK")"
@@ -247,6 +259,26 @@ jobs:
               grep -nE 'error:|Error [0-9]|\*\*\*|No rule to make target|No such file' \
                 "$WORK/kernel-verbose.log" | tail -25 || true
               tail -40 "$WORK/kernel-verbose.log" || true
+              # 一轮拿全不兼容补丁清单：make 遇到第一个打不上的补丁就停，
+              # 逐个 dry-run 才能避免每 40 分钟只暴露一个。
+              TREE="$PWD"
+              KSRC=$(find build_dir -maxdepth 6 -type d -name "linux-$PROBE_KV.*" 2>/dev/null | head -1 || true)
+              if [ -n "$KSRC" ]; then
+                echo "=== patches-$PROBE_KV 全量 dry-run 预检（内核源码 $KSRC）==="
+                BAD=0
+                for p in "$TREE/target/linux/rtl9617c/patches-$PROBE_KV"/*.patch; do
+                  [ -f "$p" ] || continue
+                  if (cd "$KSRC" && patch -p1 -R --dry-run --batch < "$p") >/dev/null 2>&1; then
+                    echo "  APPLIED   $(basename "$p")"
+                  elif (cd "$KSRC" && patch -p1 --dry-run --batch < "$p") >/dev/null 2>&1; then
+                    echo "  OK        $(basename "$p")"
+                  else
+                    echo "  INCOMPAT  $(basename "$p")"
+                    BAD=$((BAD + 1))
+                  fi
+                done
+                echo "  合计 $BAD 个补丁在 $PROBE_KV 上不兼容（含已隔离的见 disabled-patches-$PROBE_KV）"
+              fi
               echo "::error::内核编不过，详见 kernel-verbose.log"; exit 1
             fi
           done
