@@ -6,6 +6,11 @@ name: base-probe（25.12.6 能不能承载 TYFZA1 端口）
 #   2) target/linux/rtl9617c 声明的 KERNEL_PATCHVER（端口是 6.18）在这棵树里
 #      有没有对应的内核版本文件（25.12 系只有 target/linux/generic/kernel-6.12）
 #   3) 过得了前两道，才谈得上 defconfig / 内核与驱动编译
+#
+# 探针的「绿」= 拿到明确结论，不等于「编过了」。6.18 端口内核补丁套 6.12
+# 打不上是有效的迁移结论：step11 只认日志里的补丁失败证据与全量预检清单，
+# 输出 INCOMPATIBLE；真实编译错误、或端口原生内核系列下的失败一律 exit 1。
+# 出固件的 build.yml 及其 eBPF/BTF、honk LuCI 面板硬断言不在这里，本文件不碰。
 on:
   workflow_dispatch:
     inputs:
@@ -183,18 +188,10 @@ jobs:
                 printf '\n# kernel %s：页大小 choice 不给答案会让 syncconfig 在非交互 CI 挂掉\nCONFIG_ARM64_4K_PAGES=y\n' "$KV" >> "$CFG"
                 echo "  已补 CONFIG_ARM64_4K_PAGES=y 到 config-$KV（4KB 是 arm64 默认）"
               fi
-              # 211 给 RTL8221B PHY 加 .probe，但 6.18 的 realtek_main.c 结构体与
-              # 6.12 不同，实测两个 hunk 全 FAILED。探针阶段先隔离它，让构建继续
-              # 暴露后面的补丁；隔离清单会打印，绝不悄悄丢补丁。
-              PD="$TDIR/patches-$KV"
-              HOLD="$WORK/disabled-patches-$KV"
-              mkdir -p "$HOLD"
-              for p in 211-realtek-rtl8221b-private-state.patch; do
-                if [ -f "$PD/$p" ]; then
-                  mv "$PD/$p" "$HOLD/$p"
-                  echo "  ⚠ 隔离 6.12 不兼容补丁 $p → $HOLD（探针结论必须算上这笔）"
-                fi
-              done
+              # 不做「隔离打不上的补丁再继续编」：实测 6.12 上有 10 个补丁不兼容
+              # （211 与 213 先后挡住，全量 dry-run 又列出 150/190/202/207/210/216/217/218）。
+              # 逐个隔离只会让内核越编越缺 PON/flowtable/WiFi 功能，还把「编过了」
+              # 变成假答案。整份补丁保持原样，由 step11 的全量预检一次列清并给结论。
             fi
           fi
           echo "改后：$(grep -E '^KERNEL_PATCHVER' "$MK")"
@@ -262,25 +259,49 @@ jobs:
               # 一轮拿全不兼容补丁清单：make 遇到第一个打不上的补丁就停，
               # 逐个 dry-run 才能避免每 40 分钟只暴露一个。
               TREE="$PWD"
+              : > "$WORK/dryrun.log"
               # 必须只认 target 目录下真正编内核的那棵树；find 取第一个 linux-* 会
               # 选中 toolchain-*/linux-6.12.112（只有头文件），那上面的 dry-run 全是假 INCOMPAT。
               KSRC=$(find build_dir -maxdepth 7 -type d \
                 -path "*/target-*/linux-rtl9617c_generic/linux-$PROBE_KV.*" 2>/dev/null | head -1 || true)
               if [ -n "$KSRC" ]; then
-                echo "=== patches-$PROBE_KV 全量 dry-run 预检（内核源码 $KSRC）==="
-                BAD=0
-                for p in "$TREE/target/linux/rtl9617c/patches-$PROBE_KV"/*.patch; do
-                  [ -f "$p" ] || continue
-                  if (cd "$KSRC" && patch -p1 -R --dry-run --batch < "$p") >/dev/null 2>&1; then
-                    echo "  APPLIED   $(basename "$p")"
-                  elif (cd "$KSRC" && patch -p1 --dry-run --batch < "$p") >/dev/null 2>&1; then
-                    echo "  OK        $(basename "$p")"
-                  else
-                    echo "  INCOMPAT  $(basename "$p")"
-                    BAD=$((BAD + 1))
-                  fi
-                done
-                echo "  合计 $BAD 个补丁在 $PROBE_KV 上不兼容（含已隔离的见 disabled-patches-$PROBE_KV）"
+                {
+                  echo "=== patches-$PROBE_KV 全量 dry-run 预检（内核源码 $KSRC）==="
+                  BAD=0
+                  for p in "$TREE/target/linux/rtl9617c/patches-$PROBE_KV"/*.patch; do
+                    [ -f "$p" ] || continue
+                    if (cd "$KSRC" && patch -p1 -R --dry-run --batch < "$p") >/dev/null 2>&1; then
+                      echo "  APPLIED   $(basename "$p")"
+                    elif (cd "$KSRC" && patch -p1 --dry-run --batch < "$p") >/dev/null 2>&1; then
+                      echo "  OK        $(basename "$p")"
+                    else
+                      echo "  INCOMPAT  $(basename "$p")"
+                      BAD=$((BAD + 1))
+                    fi
+                  done
+                  echo "  合计 $BAD 个补丁在 $PROBE_KV 上不兼容"
+                } 2>&1 | tee "$WORK/dryrun.log"
+              fi
+
+              # 探针契约：绿 = 拿到明确的迁移结论，不等于「编过了」。
+              # 仅在①做 6.18→6.12 这类试验性回移、②日志里有真实的补丁应用
+              # 失败证据时，把 INCOMPATIBLE 作为正式结论收下；证据全部从真实
+              # 日志与全量预检结果里提取，不许脚本凭空给答案。
+              # 真实编译错误、或端口原生内核系列下的失败，一律 exit 1 照实红。
+              BADPATCH=$(grep -oE 'Patch failed! +Please fix [^ ]+' \
+                "$WORK/kernel-verbose.log" | sed 's|.*/||; s/!$//' \
+                | sort -u | paste -sd, - || true)
+              BADN=$(grep -c '  INCOMPAT  ' "$WORK/dryrun.log" 2>/dev/null || true)
+              BADLIST=$(sed -n 's/^  INCOMPAT  //p' "$WORK/dryrun.log" 2>/dev/null \
+                | paste -sd, - || true)
+              if [ -n "$BADPATCH" ] && [ -n "${PROBE_KV:-}" ] \
+                 && [ "$PROBE_KV" != "${PORT_KERNEL_PATCHVER:-}" ]; then
+                echo "KERNEL_VERDICT=INCOMPATIBLE" >> "$GITHUB_ENV"
+                echo "KERNEL_BADPATCH=$BADPATCH" >> "$GITHUB_ENV"
+                echo "KERNEL_BADLIST=${BADLIST:-（预检未取到清单，见 dryrun.log）}" >> "$GITHUB_ENV"
+                echo "VERDICT: 官方 $PROBE_REF 不能直接承载 $PORT_KERNEL_PATCHVER 端口：$BADPATCH 打不上，全量预检共 ${BADN:-0} 个补丁不兼容"
+                echo "::warning::探针结论（非构建脚本故障）：$PORT_KERNEL_PATCHVER 端口内核补丁与 $PROBE_KV 基座不兼容"
+                break
               fi
               echo "::error::内核编不过，详见 kernel-verbose.log"; exit 1
             fi
@@ -299,10 +320,21 @@ jobs:
         run: |
           {
             echo "## 基座探针结论"
-            echo "- 基座：`$PROBE_REF`｜内核覆盖：`${PROBE_KV:-（用端口声明）}`"
+            # 反引号在双引号里会被当命令替换执行（上一轮日志里的
+            # "v25.12.6: command not found" 就是这么来的），必须转义。
+            echo "- 基座：\`$PROBE_REF\`｜内核覆盖：\`${PROBE_KV:-（用端口声明）}\`"
             echo "- 端口：\`$PORT_SHA\`（声明 KERNEL_PATCHVER=$PORT_KERNEL_PATCHVER）"
             echo "- overlay/补丁：见 overlay.log 最后一行 VERDICT"
+            echo "- 内核实编：${KERNEL_VERDICT:-（未启用，或已编过）}"
             echo "- 作业结论：$JOB_STATUS"
+            if [ "${KERNEL_VERDICT:-}" = INCOMPATIBLE ]; then
+              echo ""
+              echo "> **迁移结论：官方 $PROBE_REF 不能直接承载该 $PORT_KERNEL_PATCHVER 端口。**"
+              echo "> 首个打不上的补丁：\`${KERNEL_BADPATCH:-见 kernel-verbose.log}\`"
+              echo "> 全量 dry-run 不兼容清单：${KERNEL_BADLIST:-见 dryrun.log}"
+              echo "> 要真正切基座，必须把整份 patches-$PORT_KERNEL_PATCHVER 按 $PROBE_KV 内核源码重基线。"
+              echo "> 本探针不产可刷固件；出固件仍走 build.yml（25.12.6 稳定版源 + BTF/honk 硬断言）。"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           JOB_STATUS: ${{ job.status }}
