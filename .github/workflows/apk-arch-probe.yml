@@ -48,7 +48,9 @@ jobs:
             echo "::error::拿不到 apk（没装成也没有 docker）—— 这条快探针做不了"
             exit 1
           fi
-          "$APK" --version
+          # APK 是写进 GITHUB_ENV 的，本步骤里还取不到（set -u 会直接炸），
+          # 版本打印放到真正用它的那一步。
+          echo "apk 来源已选定，下一步用"
 
       - name: Take the real rootfs from the Release
         env:
