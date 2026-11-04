@@ -1,0 +1,767 @@
+name: build
+
+# ============================================================
+# TYFZA1（Realtek RTL9617C，4×Cortex-A55，Linux 6.18.55）专用构建线：本仓库只做这一台设备。
+#   端口与基座按 SHA 锁在 pins.env（不 fork 任何人）。
+#   我们只额外加四样：内核 BTF/eBPF 前提、honk（daeuniverse 官方 release 二进制 + LuCI 前端）、
+#   用户自己的 luci-theme-lucent、以及"首启启用射频不广播"的小包；其余一律沿用上游行为。
+#   与 base-probe.yml 的分工：这条线出可刷固件，那条回答"能不能换 25.12.6 基座"。
+# ============================================================
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TYFZA1_WORK: ${{ github.workspace }}/tyfza1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load pins
+        run: |
+          set -euo pipefail
+          set -a; . ./pins.env; set +a
+          : "${PORT_URL:?pins.env 缺 PORT_URL}" ; : "${PORT_SHA:?pins.env 缺 PORT_SHA}"
+          {
+            echo "TYFZA1_URL=$PORT_URL"
+            echo "TYFZA1_SHA=$PORT_SHA"
+            echo "THEME_URL=$THEME_URL"
+            echo "THEME_SHA=$THEME_SHA"
+          } >> "$GITHUB_ENV"
+          echo "端口 $PORT_URL @ $PORT_SHA ｜主题 @ $THEME_SHA ｜honk $(sed -n 's/^HONK_VERSION=//p' "$GITHUB_WORKSPACE/honk-manifest.txt")"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -hT /
+
+      - name: Install build dependencies
+        # 抄他们 workflow 的包列表（rtl9617c 的无线/PE 部件要 clang-18/llvm-18/lld-18）
+        run: |
+          sudo apt-get -qq update -o Acquire::Retries=3
+          sudo apt-get install -y build-essential busybox clang-18 llvm-18 lld-18 flex bison gawk \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip \
+            zlib1g-dev file wget curl device-tree-compiler u-boot-tools swig \
+            libelf-dev python3-pyelftools python3-dev libfuse-dev pkgconf cmake ninja-build ccache
+
+      - name: OMCI compiler (rust pinned by their workflow)
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup target add --toolchain 1.96.1 aarch64-unknown-linux-musl
+          echo "TYFZA1_CARGO=$(rustup which --toolchain 1.96.1 cargo)" >> "$GITHUB_ENV"
+
+      - name: Runtime inputs (their public release artifact)
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          mkdir -p artifacts/runtime-inputs
+          # 他们的 build.sh 在没有 TYFZA1_RUNTIME_INPUTS 时会去找 analysis/private/*
+          # （私有原厂素材）→ CI 里必须用这个公开的素材包
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -o artifacts/tyfza1-runtime-inputs-v1.tar.gz \
+            "https://github.com/LeoooChen/PonWRT-TYFZA1/releases/download/v0.1.0-alpha/tyfza1-runtime-inputs-v1.tar.gz"
+          tar -xzf artifacts/tyfza1-runtime-inputs-v1.tar.gz -C artifacts/runtime-inputs
+          echo "runtime-inputs: $(ls artifacts/runtime-inputs | tr '\n' ' ')"
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+
+      - name: FIT signing key (public, sha256 pinned)
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          mkdir -p artifacts/signing
+          # 与上游一致：key 来自公开的 GPL-for-GP3000，且带 sha256 校验。
+          # 他们的原生 U-Boot 验证启动认的就是这把公开 key，换成我们自己的会验不过。
+          curl -fsSL --retry 3 --max-time 120 -o artifacts/signing/dev.key \
+            https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/5090fbcb6ba743dd7b1314811ef557bad0460147/bootloader/Verified_Boot/verifed_key_06-04-2020/dev.key
+          echo 'bea80932793531fe263f62bf4de3ee95754ea7b9766eda23a418c22f06ce127f  artifacts/signing/dev.key' | sha256sum -c -
+          openssl req -new -x509 -key artifacts/signing/dev.key -out artifacts/signing/dev.crt -subj /CN=TYFZA1-FIT -days 3650
+
+      - name: Obtain locked OpenWrt source
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          sh port/scripts/prepare.sh sources/openwrt
+          echo "openwrt = $(git -C sources/openwrt rev-parse --short HEAD)"
+          grep -oE '"commit": *"[0-9a-f]+"' port/sources.lock.json | head -1
+
+      - name: Stage our additions (BTF + honk + lucent theme)
+        # 用上游自己留的 TYFZA1_CONFIG 扩展点：派生 config = 他们的 tyfza1-boot.config
+        # + 我们那几行；包放进 sources/openwrt/package/custom/，不碰他们任何文件。
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/stage-tyfza1.sh" \
+            "$TYFZA1_WORK/sources/openwrt" "$TYFZA1_WORK" \
+            "$GITHUB_WORKSPACE" "$TYFZA1_WORK/artifacts/custom.config"
+
+      - name: Reset scan cache after overlay, answer kernel (NEW) symbols
+        # 这一步干两件事：① 铺 overlay 之后把扫描缓存整体作废重扫，WiFi 驱动
+        # kmod-rtl-ax-ap 才会进包元数据（根因见下面长注释）；② 打开 BTF/FTRACE 后
+        # 被"解锁"出来的内核符号在种子里没答案，OpenWrt 带 FAIL_ON_UNCONFIGURED=1
+        # 编内核，syncconfig 见 (NEW) 直接报错，不会自己取默认值，所以逐个补答。
+        # 补答只能写回 overlay 里那份种子：build.sh 会再跑一次 sync-overlay，
+        # 树里那份会被 rsync --delete 原样覆盖回去。
+        # 试过 make kernel_oldconfig（入口名在 include/toplevel.mk:193，不是
+        # target/linux/oldconfig —— 顶层只有 %:: 兜底，那个字符串会 "No rule to make target"），
+        # 但它从**种子**重建 .config（include/target.mk:212），会把我们的 CONFIG_KERNEL_*
+        # 覆盖丢掉：结果是 DEBUG_INFO 在、BTF 没了、种子一行没变 —— 白过。
+        # 所以这里改成：先让 OpenWrt 自己做一次「种子 + 覆盖」的 configure，在那份 .config
+        # 上补答，再把被提问过的符号写回种子。只动 CI 工作树，上游仓库一个字不改。
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          export TYFZA1_CONFIG="$PWD/artifacts/custom.config"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          # 上一轮 kernel_oldconfig 本身跑通了，但它答的是 **mediatek/filogic** 的种子：
+          # port/scripts/prepare.sh 只 fetch 上游 openwrt@PIN，rtl9617c 这个 target 是
+          # sync-overlay.sh 才 rsync 进去的（build.sh 第 25 行 sync-overlay → 26 行
+          # prepare_luci_feeds → 33 行 make defconfig）。我们在 defconfig 之前没铺 overlay，
+          # .config 就落回基线默认机型，答的自然是别人的内核配置。
+          # 这里提前调同一条命令；它是幂等的（rsync --delete + 先 sed 删再 printf 追加），
+          # 后面 build.sh 再执行一遍不会叠加。
+          sh port/scripts/sync-overlay.sh sources/openwrt > sync-overlay.log 2>&1 || {
+            echo "::error::上游 sync-overlay 失败"; tail -30 sync-overlay.log; exit 1; }
+          [ -d sources/openwrt/target/linux/rtl9617c ] \
+            || { echo "::error::overlay 之后仍然没有 target/linux/rtl9617c"; exit 1; }
+          cd sources/openwrt
+          # —— 根因（这一轮证据闭合，之前两次推断都错在这儿）——
+          # KernelPackage/rtl-ax-ap 不属于 target/linux 那趟扫描。它是被
+          # package/kernel/linux/Makefile 带进包目录列表的：
+          #   15 行 SUBTARGETS = $(notdir $(wildcard target/linux/* target/linux/feeds/*))
+          #   16 行 SUBTARGET_MODULES = …/target/linux/$(t)/modules.mk
+          #   17 行 SCAN_DEPS = modules/*.mk $(TOPDIR)/target/linux/*/modules.mk …
+          #   78 行 -include $(SUBTARGET_MODULES)
+          # 所以 kmod-rtl-ax-ap 只可能出现在 tmp/.packageinfo → tmp/.config-package.in。
+          # .config-target.in 里那 7 处命中全是设备 profile 侧的 DEFAULT_/MODULE_DEFAULT_，
+          # 其中 316250 行 `select PACKAGE_kmod-rtl-ax-ap` 选的是一个当时根本不存在的符号，
+          # kconfig 不会为它建 CONFIG_ 项 → --defconfig 写出来的 .config 里那行必然消失；
+          # 与我们的追加无关（对照 A 上游原文同样丢，就是这个道理）。
+          # 上一轮我 rm 的只有 .packageinfo/.targetinfo 和 .files-* 文件清单戳，
+          # **漏了每个目录各自的 dump 缓存 tmp/info/.packageinfo-<目录>**：第 11 步
+          # stage-honk 为了自检在 sync-overlay 之前扫过一次，那时 target/linux/rtl9617c
+          # 还不存在，package/kernel/linux 那份缓存天生缺 WiFi；rsync -a 保留上游 mtime，
+          # 比缓存还旧 → make 判定"依赖没变" → 拼回去的还是缺 WiFi 的那份。
+          # 要作废就把整份 tmp/info 一起作废，别赌文件名。
+          rm -rf tmp/info \
+                 tmp/.packageinfo tmp/.targetinfo \
+                 tmp/.config-package.in tmp/.config-target.in \
+                 tmp/.packagedeps tmp/.packageauxvars tmp/.packageusergroup
+          # 扫描失败默认是看不见的：scan.mk 用 `make -r DUMP=1 … 2>/dev/null || { 把原因
+          # 写进 logs/<目录>/dump.txt 后删掉产物 }`。所以只报"缺不缺"定不了位，
+          # 这里显式带 V=s 重扫一次，并把四份索引和 dump 一起打出来。
+          # 上一版探针什么都没打出来就红了，两个原因都在我自己身上：
+          #   1) 锚定写错。package-metadata.pl:364 是 print "\t" 再 print "config PACKAGE_…"，
+          #      条目行前面带一个 TAB，`^config PACKAGE_…$` 永远匹配不到。
+          #   2) 第二条管道以 `… | while read` 结尾、没有 `|| true`：depends 里一个符号都没
+          #      grep 中时 grep 返回 1，pipefail + set -e 直接把整个步骤弄红，
+          #      证据反而没拿到。现在每条诊断都自带 `|| true`，且函数以 return 0 收尾。
+          wifi_diag() {
+            local f n c ln IN
+            for f in tmp/.packageinfo tmp/.targetinfo tmp/.config-package.in tmp/.config-target.in; do
+              if [ -f "$f" ]; then n=$(wc -l < "$f"); c=$(grep -c 'rtl-ax-ap' "$f" || true); else n='-'; c='-'; fi
+              printf '  %-24s 行数=%-7s rtl-ax-ap 命中=%s\n' "$f" "$n" "$c"
+            done
+            echo "  [$1] .config 里相关行：$( { grep -E '^#? *CONFIG_(PACKAGE_)?(kmod-rtl-ax-ap|TARGET_rtl9617c).*' .config || true; } | tr '\n' ' ' )"
+            echo "  [$1] tmp/.packageinfo 里的条目原文（Depends: 就在这儿）："
+            awk '/^Package: kmod-rtl-ax-ap$/{f=1} f{print "    " $0} f&&/^Package: /&&!/kmod-rtl-ax-ap/{exit}' \
+              tmp/.packageinfo 2>/dev/null | head -16 || true
+            echo "  [$1] kconfig 条目（含外层 if/menu；两份索引分别找）："
+            for IN in tmp/.config-package.in tmp/.config-target.in; do
+              [ -f "$IN" ] || continue
+              ln=$(awk '/^[[:space:]]*config PACKAGE_kmod-rtl-ax-ap$/{print NR; exit}' "$IN" 2>/dev/null || true)
+              if [ -n "${ln:-}" ]; then
+                echo "    == 条目在 $IN 第 $ln 行 =="
+                sed -n "$((ln>10 ? ln-10 : 1)),$((ln+18))p" "$IN"
+              else
+                echo "    == $IN 里没有 config PACKAGE_kmod-rtl-ax-ap =="
+              fi
+            done
+            echo "  [$1] 条目引用的 depends/select 符号 → 在 kconfig 里定义了吗 / 当前 .config 的值："
+            { awk 'FNR==1{f=0} /^[[:space:]]*config PACKAGE_kmod-rtl-ax-ap$/{f=1;next} f&&/^[[:space:]]*(depends on|select)/{print} f&&/^[[:space:]]*help$/{exit}' \
+                  tmp/.config-package.in tmp/.config-target.in 2>/dev/null \
+                | sed -E 's/^[[:space:]]*(depends on|select)[[:space:]]+//; s/[()&|!]+/ /g' | tr -s ' \t' '\n' \
+                | grep -E '^[A-Za-z_][A-Za-z0-9_-]*$' | sort -u || true; } \
+              | while read -r sym; do
+                  val=$( { grep -m1 -E "^CONFIG_$sym=|^# CONFIG_$sym is not set" .config || true; } | head -1)
+                  def=$( { grep -hcE "^[[:space:]]*config $sym\$" tmp/.config-target.in tmp/.config-package.in tmp/.config-feeds.in 2>/dev/null || true; } \
+                         | awk '{s+=$1} END{print s+0}')
+                  printf '    %-30s 定义处=%s 值=%s\n' "$sym" "$def" "${val:-（.config 里没有）}"
+                done
+            return 0
+          }
+          make -s prepare-tmpinfo V=s > "$TYFZA1_WORK/tmpinfo.log" 2>&1 || echo "::warning::prepare-tmpinfo 非 0 退出，看下面的扫描诊断"
+          echo "=== 包扫描诊断（整份 tmp/info 作废后重扫）==="; wifi_diag "扫描后"
+          echo "--- tmpinfo.log 里的错误行 ---"; grep -inE "error|failed|nothing to be done" "$TYFZA1_WORK/tmpinfo.log" | head -12 || true
+          if [ -d logs ]; then find logs -name 'dump.txt' 2>/dev/null | head -5 | while read -r d; do echo "== $d"; tail -15 "$d"; done; fi
+          # 硬断言：作废全部扫描缓存后重扫，WiFi 驱动必须进包元数据。缺了就是
+          # dump 这一步真出错（scan.mk 会把原因塞进 logs/<目录>/dump.txt 并删产物），
+          # 后面 defconfig 必然把它丢，编 40 分钟也只是再产一个没 WiFi 的镜像。
+          PKHIT=$( { grep -c '^Package: kmod-rtl-ax-ap$' tmp/.packageinfo 2>/dev/null || true; } )
+          INHIT=$( { grep -hc 'config PACKAGE_kmod-rtl-ax-ap' tmp/.config-package.in tmp/.config-target.in 2>/dev/null || true; } \
+                   | awk '{s+=$1} END{print s+0}')
+          echo "重扫结果：.packageinfo 条目=$PKHIT  kconfig 条目=$INHIT"
+          if [ "${PKHIT:-0}" = "0" ] || [ "${INHIT:-0}" = "0" ]; then
+            echo "::error::重扫后 kmod-rtl-ax-ap 还是没进包元数据 → 不是缓存问题，是 package/kernel/linux 的 dump 出错"
+            for d in logs/package/kernel_linux/dump.txt logs/package/kernel/linux/dump.txt; do
+              { [ -s "$d" ] && { echo "== $d"; tail -30 "$d"; }; } || true
+            done
+            exit 1
+          fi
+          # tools/install 之前必须先 defconfig：否则 toplevel.mk 把 .config 当过期目标，
+          # 转手调 menuconfig，CI 无终端 → "Error opening terminal: unknown"。
+          make defconfig </dev/null > "$TYFZA1_WORK/defconfig.log" 2>&1 || {
+            echo "::error::make defconfig 失败"; tail -40 "$TYFZA1_WORK/defconfig.log"; exit 1; }
+          # make defconfig 的真身是 scripts/config/conf --defconfig=.config Config.in
+          # （include/toplevel.mk:149-153）：把现有 .config 当"片段"重算一遍，depends
+          # 不成立的符号会被**静默**丢掉。kconfig 的警告一直在 defconfig.log 里，前面几轮
+          # 只 tail 了失败分支，从没打过它 —— 这可能就是答案本身。
+          echo "--- defconfig.log 里的 kconfig 警告/依赖类信息 ---"
+          grep -inE 'warn|unmet|depend|error' "$TYFZA1_WORK/defconfig.log" | head -25 || true
+          echo "=== defconfig 之后再扫一遍诊断 ==="; wifi_diag "第 1 次 defconfig 后"
+          # —— 对照实验：是"我们加的那几行"弄丢了 WiFi，还是这棵树本来就留不住它 ——
+          # 同一棵树、同一份扫描索引，只换 .config 的内容，各跑一次 defconfig 数结果。
+          # A=上游 boot config 原文，B=原文+我们的 CONFIG_KERNEL_* 段，C=原文+我们的包段，
+          # D=线上真正用的完整派生 config。四份结果并排看，谁杀的WiFi一目了然。
+          ctrl() {
+            local name="$1" src="$2"
+            cp "$src" .config
+            R_KMOD=0; R_BTF=0
+            if make defconfig </dev/null > "$TYFZA1_WORK/ctrl-$name.log" 2>&1; then
+              R_KMOD=$( { grep -c '^CONFIG_PACKAGE_kmod-rtl-ax-ap=y' .config || true; } )
+              R_BTF=$( { grep -c '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config || true; } )
+              printf '  [%s] kmod-rtl-ax-ap=%s  BTF(.config 里的 CONFIG_KERNEL_ 覆盖)=%s  wpad=%s  iw=%s\n' "$name" \
+                "$R_KMOD" "$R_BTF" \
+                "$( { grep -c '^CONFIG_PACKAGE_wpad-mbedtls=y' .config || true; } )" \
+                "$( { grep -c '^CONFIG_PACKAGE_iw=y' .config || true; } )"
+              cp .config "$TYFZA1_WORK/config-$name"
+            else
+              printf '  [%s] 这份 config 的 defconfig 直接失败：\n' "$name"
+              tail -15 "$TYFZA1_WORK/ctrl-$name.log" || true
+            fi
+            return 0
+          }
+          BASECFG="$TYFZA1_WORK/port/configs/tyfza1-boot.config"
+          echo "=== 对照（根因已定位，这两组只当护栏）：A 上游原文 / D 线上派生 ==="
+          PURE_KMOD=0; DERIVED_KMOD=0
+          if [ -s "$BASECFG" ]; then
+            ctrl A_pure "$BASECFG"; PURE_KMOD=$R_KMOD
+          else
+            echo "::warning::找不到上游底配置 $BASECFG，跳过 A"
+          fi
+          ctrl D_derived "$TYFZA1_CONFIG"; DERIVED_KMOD=$R_KMOD
+          # WiFi 驱动 kmod-rtl-ax-ap 定义在 target/linux/rtl9617c/modules.mk 里
+          # （KernelPackage，里面装着 cfg80211/mac80211/rtl_ax_ap 三个 .ko）。
+          # 这类包能不能被选中要看两件事：包扫描有没有看到那个目录、以及可用性判定
+          # 读到的内核 .config 是否已经生成。第一次 defconfig 时第二件还没发生，
+          # 所以先打三个事实，不靠猜。
+          wifi_probe() {
+            # 处处 || true：这是诊断，不该诊断自己把作业弄红。上一版里
+            # `k=$(find build_dir …)` 在还没有 build_dir 时返回 1，pipefail+set -e
+            # 直接死在第 1 次探针上，反而没看到后面的证据。
+            local k=""
+            echo "  [$1] 扫到了吗：tmp/.packageinfo 里 kmod-rtl-ax-ap = $(grep -c '^Package: kmod-rtl-ax-ap$' tmp/.packageinfo 2>/dev/null || true) 处"
+            echo "  [$1] .config 里：$(grep -E '^CONFIG_PACKAGE_kmod-rtl-ax-ap=|^# CONFIG_PACKAGE_kmod-rtl-ax-ap is not set' .config 2>/dev/null || echo '（这行不见了 → defconfig 把它丢了）')"
+            k=$(find build_dir -maxdepth 4 -type f -name .config -path '*linux-rtl9617c*' 2>/dev/null | head -1 || true)
+            if [ -n "$k" ]; then
+              echo "  [$1] 内核侧：$k → $(grep -E '^CONFIG_(RTL_AX_AP|CFG80211|MAC80211)=' "$k" 2>/dev/null | tr '\n' ' ' || true)"
+            else
+              echo "  [$1] 内核侧：还没有内核 .config（KernelPackage 的可用性判不出来，属预期）"
+            fi
+            return 0
+          }
+          wifi_probe "第 1 次 defconfig 后"
+          # 当场把关，不留到 40 分钟后：符号已经存在（上面的硬断言）、上游原文也丢，
+          # 说明还有别的机制在丢它，那时候需要的同样是条目原文，而不是一个镜像。
+          if [ "${DERIVED_KMOD:-0}" = "0" ] || [ "${PURE_KMOD:-0}" = "0" ]; then
+            echo "::error::扫描已包含 kmod-rtl-ax-ap，但 defconfig 仍把它丢了（A=$PURE_KMOD D=$DERIVED_KMOD）"
+            echo "::error::看上面 depends/select 符号的「定义处」与取值，以及 .packageinfo 条目里的 Depends:"
+            exit 1
+          fi
+          grep -qx 'CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config \
+            || { echo "::error::defconfig 把 BTF 丢了（片段没生效？）"; exit 1; }
+          # 机型必须是我们那台，不然 oldconfig 答的是别的 target。
+          # 用他们 boot config 里就有的符号（archived config.buildinfo 里没有
+          # CONFIG_TARGET_BOARD 这种内部符号，拿它断言会假失败）。
+          grep -q '^CONFIG_TARGET_rtl9617c=y' .config \
+            || { echo "::error::.config 里没启用 rtl9617c：$(grep -m3 '^CONFIG_TARGET_' .config | tr '\n' ' ')"; exit 1; }
+          grep -q '^CONFIG_TARGET_rtl9617c_generic=y' .config \
+            || { echo "::error::.config 里没启用 rtl9617c/generic 子目标"; exit 1; }
+          echo "✅ defconfig 后 BTF 仍在、机型为 rtl9617c（.config $(grep -c '^CONFIG_' .config) 条）"
+          make tools/install -j"$(nproc)" > "$TYFZA1_WORK/oldconfig-tools.log" 2>&1 || {
+            echo "::error::tools/install 失败"; tail -40 "$TYFZA1_WORK/oldconfig-tools.log"; exit 1; }
+          # 还必须有 toolchain：内核 scripts/Kconfig.include:40 会真的去跑 $(CC) 探选项，
+          # 上一轮这里报
+          #   make[5]: aarch64-openwrt-linux-musl-gcc: No such file or directory
+          #   scripts/Kconfig.include:40: C compiler 'aarch64-openwrt-linux-musl-gcc' not found
+          # 于是 syncconfig 在"提问"之前就死了 —— 日志里根本没有 (NEW) 行，
+          # 我那套按 (NEW) 补答案的循环当然一轮也命不中。build.sh 迟早要做这一步，
+          # 提前做不重复花时间（同一套 stamp）。
+          make toolchain/install -j"$(nproc)" > "$TYFZA1_WORK/oldconfig-toolchain.log" 2>&1 || {
+            echo "::error::toolchain/install 失败"; tail -40 "$TYFZA1_WORK/oldconfig-toolchain.log"; exit 1; }
+          echo "✅ tools + toolchain 就位（内核 kconfig 要用交叉编译器探选项）"
+          # 不能用 kernel_oldconfig：它第一步是 LINUX_RECONF_CMD，从**种子**重建
+          # $(LINUX_DIR)/.config（include/target.mk:212），把我们 CONFIG_KERNEL_* 的覆盖丢掉。
+          # 上一轮的现象就是这么来的：DEBUG_INFO 还在（种子里本来就有）、BTF 没了、种子一行没改。
+          # 我们要的是 kernel-defaults.mk:117-119 那份「种子 + 我们的覆盖」合成后的 .config，
+          # 所以先真跑一次 configure（它会在 .modules 的 syncconfig 上按预期失败），
+          # 循环：编一次 → 若失败是 kconfig 提 (NEW)，就把**这些被提问的符号**的答案写回种子 → 再编。
+          # 上一轮的错误做法：用 kconfig.pl '>' 求「种子 vs 完整 .config」的全量差集写回 ——
+          # 种子只有 652 行、完整 .config 六千行，差集 2887 行全是"种子本来就不必写的默认项"，
+          # 那不是补答，是污染种子；第二次编译几秒就红了。
+          echo "=== 1..n) 编译尝试 → 只补 (NEW) 提问过的符号 → 再试（最多 4 轮）==="
+          HOSTBIN="$PWD/staging_dir/host/bin"
+          [ -x "$HOSTBIN/pahole" ] || { echo "::error::$HOSTBIN/pahole 不存在（tools/dwarves 应由 CONFIG_DWARVES 编出）"; ls "$HOSTBIN" | grep -i pahole || true; exit 1; }
+          echo "pahole：$("$HOSTBIN/pahole" --version | head -1)"
+          SEED=""; OVL=""; BUILT=""; TRIES=0
+          # 从一次尝试的输出 + OpenWrt 的 logs/ 里提取被提问的符号名。
+          # 用 `find -exec cat {} +` 而不是 `cat "$(find …)"`：后者把整串多行路径当成一个文件名，
+          # logs/ 里只有一个文件时也能"看起来正常"，多文件时就读不到任何东西。
+          pick_new() {
+            { cat "$1" 2>/dev/null; find logs -type f -exec cat {} + 2>/dev/null | tail -c 400000; } \
+              | grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' \
+              | sed -E 's/\) \[.*//; s/^\(//' | sort -u || true
+          }
+          for i in 1 2 3 4; do
+            log="$TYFZA1_WORK/kernel-try-$i.log"
+            if make target/compile -j"$(nproc)" > "$log" 2>&1; then
+              BUILT=1; echo "✅ 第 $i 次尝试：内核编过了"; break
+            fi
+            KD=$(find build_dir -maxdepth 4 -type d -name 'linux-6.18*' -path '*rtl9617c*' | head -1)
+            [ -n "$KD" ] || { echo "::error::第 $i 次尝试后没有 rtl9617c 的内核构建目录"; tail -40 "$log"; exit 1; }
+            [ -s "$KD/.config" ] || { echo "::error::第 $i 次：内核 .config 没生成（configure 没跑到）"; tail -40 "$log"; exit 1; }
+            [ -n "$SEED" ] || SEED=$(find target/linux/rtl9617c -maxdepth 2 -type f -name 'config-*' | head -1)
+            [ -n "$SEED" ] || { echo "::error::找不到 rtl9617c 的内核种子配置"; exit 1; }
+            # 答案必须写进 **overlay 里那份**种子：port/scripts/sync-overlay.sh:15 是
+            # `rsync -a --delete port/overlay/target/linux/rtl9617c/ → 树`，
+            # build.sh 第 25 行会再跑一次它，树里那份会被原样覆盖回上游版本 ——
+            # 上一轮就是这样：第 12 步内核编过了，第 13 步 build.sh 又把
+            # LEDS_TRIGGER_TYFZA1_USB (NEW) 重新问了一遍。
+            [ -n "${OVL:-}" ] || OVL="$TYFZA1_WORK/port/overlay/target/linux/rtl9617c/$(basename "$SEED")"
+            [ -s "$OVL" ] || { echo "::error::overlay 里没有对应种子文件：$OVL（写树里会被 rsync --delete 擦掉）"; exit 1; }
+            # (NEW) 提问在哪份文件里，取决于 make 的输出模式：
+            #   并行不带 V=s 时 OpenWrt 把每个阶段的输出收进 logs/，stdout 只剩摘要，
+            #   所以上一轮我在 $log 里根本找不到提问（不是"kconfig 没提问"）。
+            # 因此两处都查；还查不到就用 -j1 V=s 单跑一次（提问一定在 stdout 上），
+            # 再拿不到才是真的别的错误。
+            NEW=$(pick_new "$log")
+            if [ -z "$NEW" ]; then
+              vlog="$TYFZA1_WORK/kernel-verbose-$i.log"
+              echo "第 $i 次：stdout/logs/ 里没抓到提问，用 -j1 V=s 单跑一次拿提问"
+              make target/compile -j1 V=s > "$vlog" 2>&1 || true
+              NEW=$(pick_new "$vlog")
+              log="$vlog"
+              if [ -z "$NEW" ]; then
+                echo "::error::第 $i 次失败，且不是 kconfig 提问导致的 —— 真错误如下"
+                if grep -qE "C compiler .* not found|No such file or directory.*-gcc" "$vlog"; then
+                  echo "::error::（内核 kconfig 跑不到交叉编译器：toolchain 没装好，不是配置问题）"
+                fi
+                grep -nE '\*\*\*|[Ee]rror:|No rule|cannot|undefined reference' "$vlog" | head -20 || true
+                LN=$(grep -nE 'ERROR: |Error [0-9]' "$vlog" | tail -1 | cut -d: -f1 || true)
+                if [ -n "${LN:-}" ]; then sed -n "$((LN>80 ? LN-80 : 1)),$((LN+15))p" "$vlog"; else tail -100 "$vlog"; fi
+                exit 1
+              fi
+            fi
+            echo "第 $i 轮：kconfig 提问 $(printf '%s\n' "$NEW" | wc -l) 个符号：$(printf '%s ' $NEW)"
+            # olddefconfig，不是 oldconfig：后者逐个提问，喂 </dev/null 会中途报错退出。
+            # PATH 必须带 staging_dir/host/bin：6.18 lib/Kconfig.debug:382 是
+            # `depends on PAHOLE_VERSION >= 116`，量不到 pahole 时 PAHOLE_VERSION=0，
+            # kconfig 会把 DEBUG_INFO_BTF 当不可见符号静默丢掉。
+            ( cd "$KD" && PATH="$HOSTBIN:$PATH" make ARCH=arm64 olddefconfig < /dev/null ) > "$TYFZA1_WORK/koldconfig-$i.log" 2>&1 || {
+              echo "::error::olddefconfig 失败"; tail -40 "$TYFZA1_WORK/koldconfig-$i.log"; exit 1; }
+            grep -qx 'CONFIG_DEBUG_INFO_BTF=y' "$KD/.config" || {
+              echo "::error::olddefconfig 之后 BTF 不见了（依赖不成立或被覆盖丢掉）"
+              grep -nE 'CONFIG_DEBUG_INFO|CONFIG_BPF_SYSCALL|CONFIG_PAHOLE' "$KD/.config" | head -14
+              tail -30 "$TYFZA1_WORK/koldconfig-$i.log"; exit 1; }
+            : > "$TYFZA1_WORK/seed-add.conf"
+            for s in $NEW; do
+              line=""
+              v=$(grep -m1 -oE "^CONFIG_$s=.*" "$KD/.config" || true)
+              if [ -n "$v" ]; then line="$v"
+              elif grep -qxF "# CONFIG_$s is not set" "$KD/.config"; then line="# CONFIG_$s is not set"
+              else echo "· 注：$s 在内核 .config 里没有可见答案（多半是无形式的派生符号）"; continue; fi
+              grep -qxF "$line" "$SEED" && continue
+              printf '%s\n' "$line" >> "$TYFZA1_WORK/seed-add.conf"
+            done
+            ADD=$(grep -c . "$TYFZA1_WORK/seed-add.conf" || true)
+            if [ "${ADD:-0}" -gt 0 ]; then
+              # 先写 overlay（真身），再按 rsync 同样的效果覆盖树里那份，
+              # 好让本轮下一次 make target/compile 就用上新答案
+              printf '\n# ponwrt：kconfig 提问过的符号，按默认值补答（仅本工作树，不改上游）\n' >> "$OVL"
+              cat "$TYFZA1_WORK/seed-add.conf" >> "$OVL"
+              cp -f "$OVL" "$SEED"
+            fi
+            TRIES=$i
+            echo "  → 写回 $OVL（并同步到 $SEED）：本轮 $ADD 行，种子现有 $(grep -c '^CONFIG_\|^# CONFIG_' "$SEED") 行"
+            git diff --stat -- target/linux/rtl9617c || true
+            git -C "$TYFZA1_WORK" diff --stat -- port/overlay || true
+          done
+          [ -n "$BUILT" ] || { echo "::error::$TRIES 轮补答后内核仍编不过"; tail -60 "$TYFZA1_WORK/kernel-try-4.log"; exit 1; }
+          KC=$(find build_dir -maxdepth 5 -type f -name .config -path '*linux-rtl9617c*' | head -1)
+          grep -E '^CONFIG_(DEBUG_INFO|DEBUG_INFO_BTF|FTRACE|FUNCTION_TRACER|DYNAMIC_FTRACE|BPF_EVENTS)=y|^# CONFIG_DEBUG_INFO_REDUCED is not set' "$KC"
+          grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$KC" || { echo "::error::重编后 BTF 又丢了（被 override 覆盖？$KC）"; exit 1; }
+          # honk 的内核前提逐条查实（BPF/BPF_SYSCALL/BPF_JIT 来自 generic 种子，
+          # NET_XGRESS 来自 rtl9617c 自己的种子；CGROUP_BPF 是 default y，
+          # 只有生成出来的 .config 里才看得见，所以在这儿断言而不是猜）
+          for s in CONFIG_BPF=y CONFIG_BPF_SYSCALL=y CONFIG_BPF_JIT=y CONFIG_NET_XGRESS=y CONFIG_CGROUP_BPF=y; do
+            grep -qx "$s" "$KC" || { echo "::error::内核缺 honk 需要的前提：$s（$KC）"; grep -nE "^#? *CONFIG_(CGROUP_BPF|NET_XGRESS|BPF_SYSCALL)" "$KC" | head; exit 1; }
+          done
+          echo "✅ 内核带着 BTF 与 eBPF 前提编过了，build.sh 那步不会卡在 syncconfig"
+          # 现在内核 .config 已经在（而且是编好的），KernelPackage 的可用性判定才有依据。
+          # 再 defconfig 一次，把 WiFi 那五项逼回 .config；逼不回来就在这儿红，
+          # 不要等 40 分钟后编出一个没 WiFi 的镜像。
+          echo "=== 二次 defconfig（内核配置已存在）==="
+          make defconfig </dev/null > "$TYFZA1_WORK/defconfig2.log" 2>&1 || {
+            echo "::error::二次 defconfig 失败"; tail -40 "$TYFZA1_WORK/defconfig2.log"; exit 1; }
+          echo "--- defconfig2.log 里的 kconfig 警告/依赖类信息 ---"
+          grep -inE 'warn|unmet|depend|error' "$TYFZA1_WORK/defconfig2.log" | head -25 || true
+          wifi_probe "第 2 次 defconfig 后"
+          wifi_diag "第 2 次 defconfig 后"
+          WIFIMISS=""
+          for p in kmod-rtl-ax-ap wpad-mbedtls wifi-scripts iw wireless-regdb; do
+            grep -qx "CONFIG_PACKAGE_$p=y" .config || WIFIMISS="$WIFIMISS $p"
+          done
+          [ -z "$WIFIMISS" ] || { echo "::error::二次 defconfig 后仍没选中 WiFi 组件:$WIFIMISS"; exit 1; }
+          echo "✅ WiFi 五项全选中（kmod-rtl-ax-ap 内含 cfg80211/mac80211/rtl_ax_ap）"
+
+      # ---------- 把自己编的包仓库变成设备上的更新源（关掉开关就是纯上游行为）----------
+
+      - name: Build OpenWrt and native PE
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          export TYFZA1_RUNTIME_INPUTS="$PWD/artifacts/runtime-inputs"
+          export TYFZA1_SIGNING_KEYS="$PWD/artifacts/signing"
+          export TYFZA1_CONFIG="$PWD/artifacts/custom.config"
+          export PATH="/usr/lib/llvm-18/bin:$PATH"
+          echo "注入 config：$(grep -c '^CONFIG_' "$TYFZA1_CONFIG") 条；我们追加的部分："
+          sed -n '/ponwrt-xg040gmd 追加/,$p' "$TYFZA1_CONFIG" | head -30
+          # 完整日志必须留盘：上一轮只 tail -60，真错误被截掉了，只能看见
+          # "ERROR: target/linux failed to build" 这一行没法定位。
+          if sh port/scripts/build.sh sources/openwrt "$(nproc)" > artifacts/build-full.log 2>&1; then
+            tail -40 artifacts/build-full.log
+          else
+            rc=$?
+            echo "=== build.sh 失败 rc=$rc，日志里的错误上下文 ==="
+            grep -nE 'error:|Error [0-9]|No rule|undefined reference|overflowed|too big|not enough space' \
+              artifacts/build-full.log | head -30 || true
+            echo "=== 出错点前后 60 行 ==="
+            LN=$(grep -nE 'ERROR: .* failed to build|Error [0-9]+' artifacts/build-full.log | tail -1 | cut -d: -f1 || true)
+            if [ -n "${LN:-}" ]; then sed -n "$((LN>60 ? LN-60 : 1)),$((LN+10))p" artifacts/build-full.log; else tail -80 artifacts/build-full.log; fi
+            echo "=== 就地用 -j1 V=s 重跑失败的那部分，拿真实编译错误 ==="
+            cd sources/openwrt
+            if grep -q 'ERROR: target/linux' ../../artifacts/build-full.log; then
+              make target/compile -j1 V=s 2>&1 | tail -100
+            elif grep -q 'ERROR: package/' ../../artifacts/build-full.log; then
+              PKG=$(grep -oE 'ERROR: package/[^ ]+' ../../artifacts/build-full.log | tail -1 | cut -d' ' -f2)
+              echo "重跑 $PKG"
+              make "package/$PKG/compile" -j1 V=s 2>&1 | tail -100
+            fi
+            exit 1
+          fi
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tyfza1-build-log-${{ github.run_id }}
+          path: |
+            tyfza1/artifacts/build-full.log
+            tyfza1/artifacts/custom.config
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: ASSERT images and our additions
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          python3 scripts/test_board_variants.py --kernel "$(python3 port/tools/project_paths.py --kernel-directory sources/openwrt)" \
+            || echo "::warning::上游机型变体自检没过（不是我们引入的话，继续看产物）"
+          N=$(find sources/openwrt/bin -name '*sysupgrade*.bin' 2>/dev/null | wc -l)
+          [ "$N" -ge 1 ] || { echo "::error::没产出 sysupgrade.bin"; find sources/openwrt/bin -maxdepth 4 -type d | head -20; exit 1; }
+          echo "✅ sysupgrade 镜像 $N 个"
+          echo "=== 1) 内核里必须有 .BTF（honk 的硬前提）==="
+          VML=$(find sources/openwrt/build_dir -maxdepth 5 -type f -name vmlinux -path '*/linux-*/*' | head -1)
+          [ -n "$VML" ] || { echo "::error::找不到 vmlinux"; exit 1; }
+          readelf -S "$VML" | grep -E '\.BTF( |_])' || { echo "::error::vmlinux 没有 .BTF 段 → BTF 没生效"; exit 1; }
+          echo "✅ .BTF 在 $VML"
+          echo "=== 2) 所有 rootfs 的 apk 库并集里必须有我们加的包 ==="
+          # 与 XG 同一条经验：PER_DEVICE_ROOTFS=y 时机型专属包在 $(KDIR)/target-dir-<id>
+          # （include/image.mk:38 的 mkfs_target_dir），不在 root-<board> 里。
+          # 按目录名挑一份 rootfs 会把"镜像里有"误判成"没有"，所以找所有 apk 库求并集。
+          DBS=$(find sources/openwrt/build_dir -maxdepth 7 -type f -path '*/lib/apk/db/installed' | sort)
+          [ -n "$DBS" ] || { echo "::error::build_dir 里没有任何 apk installed 库"; exit 1; }
+          ROOTS=$(printf '%s\n' "$DBS" | sed 's|/lib/apk/db/installed$||')
+          for db in $DBS; do
+            printf '    %s  共 %s 包  honk=%s lucent=%s\n' "${db%/lib/apk/db/installed}" \
+              "$(grep -c '^P:' "$db")" "$(grep -cE '^P:honk$' "$db")" "$(grep -cE '^P:luci-theme-lucent$' "$db")"
+          done
+          MISS=""
+          for p in honk luci-app-honk luci-lib-daeuniverse luci-theme-lucent kmod-sched-core kmod-nft-queue kmod-nfnetlink-queue v2ray-geosite; do
+            grep -qsE "^P:$p$" $DBS || MISS="$MISS $p"
+          done
+          [ -z "$MISS" ] || { echo "::error::所有 rootfs 里都没有这些包:$MISS"; exit 1; }
+          echo "✅ 我们加的包都在镜像里（并集判据，$(printf '%s\n' "$ROOTS" | wc -l) 份 rootfs）"
+          # WiFi 是上游明确承诺的功能（README「网络 → 无线」、manifest 的
+          # preinstalled_kmods 里有 kmod-rtl-ax-ap）。这个包内含 cfg80211/mac80211/
+          # rtl_ax_ap 三个 .ko —— 它一缺设备就没有任何 radio，所以在这里硬判，
+          # 不再让"编成功了但没 WiFi"过关。
+          echo "=== 2b) WiFi 栈必须真在镜像里 ==="
+          WK=""
+          for r in $ROOTS; do grep -qs '^P:kmod-rtl-ax-ap$' "$r/lib/apk/db/installed" && { WK="$r"; break; }; done
+          if [ -z "$WK" ]; then
+            echo "::error::镜像里没有 kmod-rtl-ax-ap —— 刷上去不会有任何 wlan 接口"
+            for r in $ROOTS; do
+              echo "  $r 里 WiFi 相关：$(grep -oE '^P:[A-Za-z0-9._+-]+' "$r/lib/apk/db/installed" 2>/dev/null | cut -c3- | grep -iE 'rtl|80211|wpad|wifi|regdb' | tr '\n' ' ')"
+            done
+            exit 1
+          fi
+          echo "  kmod-rtl-ax-ap 在：$WK"
+          echo "  该 rootfs 里 WiFi 相关包：$(grep -oE '^P:[A-Za-z0-9._+-]+' "$WK/lib/apk/db/installed" | cut -c3- | grep -iE 'rtl|80211|wpad|wifi|regdb|^iw$' | tr '\n' ' ')"
+          KO=$(find "$WK/lib/modules" -name 'rtl_ax_ap.ko*' 2>/dev/null | head -1)
+          [ -n "$KO" ] && echo "  驱动文件：$KO" || echo "::warning::rootfs 里没找到 rtl_ax_ap.ko（包记录了但文件没落地？检查 KernelPackage FILES）"
+          echo "=== 3) 实体文件（同样按并集找）==="
+          MISSBIN=""
+          for f in usr/bin/honk-core etc/init.d/honk; do
+            hit=""
+            for r in $ROOTS; do [ -s "$r/$f" ] && { hit="$r/$f"; break; }; done
+            [ -n "$hit" ] || MISSBIN="$MISSBIN $f"
+          done
+          [ -z "$MISSBIN" ] || { echo "::error::所有 rootfs 里都缺这些文件:$MISSBIN"; exit 1; }
+          BIN=""
+          for r in $ROOTS; do [ -s "$r/usr/bin/honk-core" ] && { BIN="$r/usr/bin/honk-core"; break; }; done
+          echo "✅ honk-core 在镜像里：$BIN ($(du -h "$BIN" | cut -f1))"
+          # 二进制版本必须是 manifest 里钉的那个：上一轮用户投诉"大鹅不是最新的"，
+          # 根因就是 manifest 落后（0.1.0-beta.4 而 feed main 已到 beta.5）。
+          HV=""
+          for db in $DBS; do
+            v=$(awk '/^P:honk$/{f=1;next} f&&/^V:/{print substr($0,3); exit} f&&/^P:/{exit}' "$db" 2>/dev/null || true)
+            [ -n "$v" ] && { HV="$v"; break; }
+          done
+          WANT=$(sed -n 's/^HONK_PKG_VERSION=//p' "$GITHUB_WORKSPACE/honk-manifest.txt")
+          # apk 库里的 V: 是「版本-revision」（实测 0.1.0_beta5-r1），等比 manifest 的
+          # HONK_PKG_VERSION（0.1.0_beta5）会假失败 —— 只比 -r 之前那段。
+          echo "  镜像里的 honk 版本 = ${HV:-（读不到）}，manifest 钉的是 $WANT"
+          [ "${HV%%-r*}" = "$WANT" ] || { echo "::error::镜像里的 honk 不是 manifest 钉的那版"; exit 1; }
+          # 主题的静态资源：3.10.9 起 Makefile 会写 root/usr/share/lucent/version，
+          # 内容就是 PKG_VERSION-rPKG_RELEASE —— 有它才算资源真的铺进去了。
+          # 上一版这里只按 htdocs/luci-static 找 *lucent* 目录就 warn，路径本身就是错的
+          # （OpenWrt 的 web 根是 www/htdocs/luci-static），所以那句"刷机后确认"其实是
+          # 我自己的查找路径没写对，不是主题的问题。
+          LV=""
+          for r in $ROOTS; do
+            for p in usr/share/lucent/version www/htdocs/luci-static usr/htdocs/luci-static; do
+              [ -e "$r/$p" ] || continue
+              if [ "$p" = usr/share/lucent/version ]; then
+                LV=$(cat "$r/$p" 2>/dev/null || true); break 2
+              fi
+              d=$(find "$r/$p" -maxdepth 2 -type d -name '*lucent*' 2>/dev/null | head -1 || true)
+              [ -n "$d" ] && { LV="dir:$d"; break 2; }
+            done
+          done
+          [ -n "$LV" ] || { echo "::error::所有 rootfs 里都没找到主题资源（version 文件或 lucent 目录）"; exit 1; }
+          echo "✅ 主题资源在镜像里：$LV"
+          # 开机启用射频那个包必须真进镜像，否则这次"默认开 WiFi"只是仓库里的一个文件
+          grep -qsE '^P:ponwrt-wifi-on$' $DBS || {
+            echo "::error::ponwrt-wifi-on 没进任何 rootfs 的 apk 库"; exit 1; }
+          SCRIPT=""
+          for r in $ROOTS; do
+            [ -s "$r/etc/uci-defaults/99-ponwrt-enable-radio" ] && { SCRIPT="$r/etc/uci-defaults/99-ponwrt-enable-radio"; break; }
+          done
+          [ -n "$SCRIPT" ] || { echo "::error::rootfs 里没有 /etc/uci-defaults/99-ponwrt-enable-radio"; exit 1; }
+          echo "✅ 首启启用射频的脚本在镜像里：$SCRIPT"
+          # 打印首启真正的无线配置与 apk 架构声明：前者回答"默认到底开没开"，
+          # 后者决定能不能吃 aarch64_generic 的第三方索引（daeuniverse 只有 generic，
+          # 没有 a55）。这两个值我不猜，留给日志。
+          for r in $ROOTS; do
+            if [ -f "$r/etc/config/wireless" ]; then
+              echo "-- $r/etc/config/wireless --"; sed 's/^/    /' "$r/etc/config/wireless" | head -30; break
+            fi
+          done
+          for r in $ROOTS; do
+            { [ -f "$r/etc/apk/arch" ] && { echo "-- apk 架构声明 --"; sed 's/^/    /' "$r/etc/apk/arch"; break; }; } || true
+          done
+
+      # 上面只判"包在不在镜像里"。这一步回答另一个问题：设备的 apk 架构吃不吃得下
+      # 第三方 aarch64_generic 索引 —— 决定"用大家都在用的源"这条要求能不能落地。
+      # 只出结论不红作业：结论没拿到之前，不往固件里塞一条可能 404 的源。
+
+      - name: Probe whether a third-party aarch64_generic index is usable
+        run: |
+          set -euo pipefail
+          T="$TYFZA1_WORK/sources/openwrt"
+          ARCH=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' "$T/.config")
+          ROOT=$(find "$T/build_dir" -maxdepth 3 -type d -name 'root-rtl9617c*' 2>/dev/null | head -1 || true)
+          DECL=""
+          { [ -n "${ROOT:-}" ] && [ -f "$ROOT/etc/apk/arch" ] && DECL=$(tr -d '\r' < "$ROOT/etc/apk/arch" | tr '\n' ' '); } || true
+          echo "设备架构声明：${DECL:-（镜像里没有 /etc/apk/arch，说明 apk 用编译期架构 $ARCH）}"
+          for a in aarch64_cortex-a55 aarch64_generic; do
+            printf '  %-22s %s\n' "$a" \
+              "$(curl -s -o /dev/null -w '%{http_code}' -L "https://openwrt.daeuniverse.org/25.12/packages/$a/packages.adb")"
+          done
+          APK="$T/staging_dir/host/bin/apk"
+          if [ ! -x "$APK" ]; then
+            echo "::notice::构建树里没有 host apk（$APK），本轮只拿到索引可达性，兼容性结论留到下次"
+            exit 0
+          fi
+          echo "用 host apk 实跑：$APK ($("$APK" --version 2>&1 | head -1))"
+          DEV_ARCH=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' "$T/.config")
+          # 两组对照：甲=设备真实的单架构；乙=额外追加 aarch64_generic 别名。
+          # 上一版我把别名直接写进探针根目录，等于自己把答案喂给自己 —— 那是假绿。
+          probe_case() {
+            local name="$1" archlist="$2" sb hit
+            sb="$TYFZA1_WORK/probe-$name"
+            rm -rf "$sb"
+            mkdir -p "$sb/etc/apk/keys" "$sb/lib/apk/db" "$sb/var/lib/apk"
+            printf '%s\n' $archlist > "$sb/etc/apk/arch"
+            # apk v3 要有可读的 db 文件才会跑 update（上一版没建 db，报的
+            # "Unable to read database" 是我自己搭的假根不完整，不是索引不兼容）
+            : > "$sb/lib/apk/db/installed"
+            : > "$sb/lib/apk/db/world"
+            cp "$GITHUB_WORKSPACE/files/etc/apk/keys/daeuniverse.pem" "$sb/etc/apk/keys/" 2>/dev/null || true
+            printf '%s\n' "@daeuniverse https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb" \
+              > "$sb/etc/apk/repositories"
+            echo "-- 用例 $name：/etc/apk/arch = $(tr '\n' ' ' < "$sb/etc/apk/arch")"
+            if "$APK" --root "$sb" update > "$TYFZA1_WORK/probe-$name.log" 2>&1; then
+              echo "   apk update 通过；索引里的 honk："
+              { "$APK" --root "$sb" search -a honk 2>&1 || true; } | head -6
+              hit=$({ "$APK" --root "$sb" search -a honk 2>/dev/null | grep -c honk || true; })
+              echo "   候选数=$hit"
+            else
+              echo "   apk update 失败："
+              tail -8 "$TYFZA1_WORK/probe-$name.log" || true
+              hit=0
+            fi
+            [ "$name" = A ] && PROBE_A_HITS=$hit || PROBE_B_HITS=$hit
+            return 0
+          }
+          PROBE_A_HITS=0; PROBE_B_HITS=0
+          probe_case A "$DEV_ARCH"
+          probe_case B "$DEV_ARCH aarch64_generic"
+          echo "VERDICT：设备原样($DEV_ARCH) 命中 $PROBE_A_HITS 个候选；加 generic 别名后命中 $PROBE_B_HITS 个"
+          if [ "${PROBE_A_HITS:-0}" -gt 0 ]; then
+            echo "VERDICT: 可以直接把 daeuniverse 的 aarch64_generic 索引写成设备源"
+          elif [ "${PROBE_B_HITS:-0}" -gt 0 ]; then
+            echo "VERDICT: 只有把 aarch64_generic 写进 /etc/apk/arch 才吃得到 generic 索引（要评估误装风险，暂不写入）"
+          else
+            echo "VERDICT: generic 索引这条路走不通 —— TYFZA1 的在线更新只能走本次构建自产的仓库"
+          fi
+
+      - name: Package release artifacts
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK"
+          mkdir -p artifacts/release
+          sh scripts/package_release.sh sources/openwrt artifacts/release
+          ls -la artifacts/release
+          (cd artifacts/release && sha256sum * 2>/dev/null | tee SHA256SUMS.local)
+
+      - name: Build stamp for the release text
+        # 滚动 tag 的 published_at 永远停在首次发布那一刻，资产又是同名覆盖重建，
+        # 所以 Release 页面"看着像没新产物"（用户两次都被这里绕住）。把时间/run/sha256
+        # 写进标题和正文头，新旧一眼就能认。时区不依赖 tzdata：UTC 加 8 小时。
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK/artifacts/release"
+          IMG=sysupgrade.bin
+          [ -s "$IMG" ] || { echo "::error::release 目录里没有 $IMG"; ls -l; exit 1; }
+          SZ=$(stat -c %s "$IMG")
+          SH=$(sha256sum "$IMG" | cut -d' ' -f1)
+          {
+            echo "IMG_NAME=$IMG"
+            echo "IMG_SIZE=$SZ"
+            echo "IMG_SHA=$SH"
+            echo "BUILD_STAMP=$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M') UTC+8"
+          } >> "$GITHUB_ENV"
+          echo "本轮产物：$IMG  $SZ 字节  sha256 $SH"
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tyfza1
+          name: 'TYFZA1 (RTL9617C) 上游 + BTF/honk/Lucent · 构建 ${{ env.BUILD_STAMP }}'
+          body: |
+            ## 本次构建（run ${{ github.run_id }}）
+            - 时间：${{ env.BUILD_STAMP }}
+            - `${{ env.IMG_NAME }}`：**${{ env.IMG_SIZE }} B**，sha256 `${{ env.IMG_SHA }}`
+            - WiFi 驱动：`/lib/modules/6.18.55/rtl_ax_ap.ko`（kmod-rtl-ax-ap 内含
+              cfg80211/mac80211/rtl_ax_ap 三个 .ko）必须在镜像里，成品断言会验。
+            - 下面的资产每次构建都**同名覆盖重建**；滚动 tag 不改 published_at，
+              所以卡片日期看着像旧的 —— 认新旧看这里的构建时间和 sha256。
+
+            基座完全按上游：<https://github.com/LeoooChen/PonWRT-TYFZA1@${{ env.TYFZA1_SHA }}>
+            （按 SHA 取，非 fork；其 sources.lock.json 锁的 openwrt commit + kernel 6.18.55）。
+            只额外加四样，且不改上游任何文件（用他们自己留的 TYFZA1_CONFIG 扩展点派生 config）：
+            1. 内核 BTF + honk 需要的 eBPF/TC 模块
+            2. honk（daeuniverse）：官方 release 静态二进制包 + luci-app-honk + luci-lib-daeuniverse
+            3. 主题 luci-theme-lucent（argon 仍在，按上游要求保留）
+            4. ponwrt-wifi-on：首启把射频 disabled 置 0，**不建 SSID、不设密码**
+               （依据：mac80211.uc 的默认 iface 是 disabled=defaults?0:1，本设备 DTS 无 wlan/defaults）
+            软件源：本仓库**不发**自建 apk 仓库 —— 设备是 aarch64_cortex-a55，官方与 daeuniverse
+            都没有该架构索引，只有 aarch64_generic；能否使用由本次构建的探针给结论
+            （看日志里 "VERDICT" 那几行），验过再写进固件，不放一条 404 的源进去。
+            认新旧：资产里的 latest.json（run_id / sha256 / built_at_local），URL 随 tag 固定。
+            RTL9617C 与 AN7581 是不同 target，本产物只用于 TYFZA1。
+            刷入见上游 README：先装他们的原生 U-Boot，恢复页 http://192.168.0.1。
+          files: ${{ github.workspace }}/tyfza1/artifacts/release/*
+          fail_on_unmatched_files: false
+
+      - name: Publish latest.json pointer into the Release
+        run: |
+          set -euo pipefail
+          cd "$TYFZA1_WORK/artifacts/release"
+          bash "$GITHUB_WORKSPACE/scripts/make-latest.sh" "$TYFZA1_WORK/pointer" \
+            device=tyfza1 \
+            target=rtl9617c/generic \
+            profile=tianyi_tyfza1 \
+            release_tag=tyfza1 \
+            firmware="$IMG_NAME" \
+            size_bytes="$IMG_SIZE" \
+            sha256="$IMG_SHA" \
+            built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            built_at_local="$BUILD_STAMP" \
+            run_id="$GITHUB_RUN_ID" \
+            run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            release_url="https://github.com/$GITHUB_REPOSITORY/releases/tag/tyfza1" \
+            firmware_url="https://github.com/$GITHUB_REPOSITORY/releases/download/tyfza1/$IMG_NAME" \
+            sha256sums_url="https://github.com/$GITHUB_REPOSITORY/releases/download/tyfza1/SHA256SUMS" \
+            wifi_driver=kmod-rtl-ax-ap \
+            upstream_sha="$TYFZA1_SHA" \
+            notes="判断新旧只看 sha256 与 built_at_local；滚动 tag 不改 published_at"
+          # 指针本身也当资产传上去：URL 随 tag 固定，人和脚本都只问一个地址
+          cp "$TYFZA1_WORK/pointer/latest.json" ./latest.json
+          echo "✅ latest.json 就位：$(wc -c < latest.json) 字节，sha256 $(sha256sum latest.json | cut -c1-12)…"
+
+
+      - name: Verify the release text carries this build
+        # 不假设 action 一定改了标题/正文：读回来验，缺了就红。
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          j=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/tyfza1")
+          printf '%s' "$j" | grep -q "$IMG_SHA" \
+            || { echo "::error::Release 正文里没有本轮 sha256（$IMG_SHA）→ 正文没被更新"; exit 1; }
+          printf '%s' "$j" | grep -q "run $GITHUB_RUN_ID" \
+            || { echo "::error::Release 正文不是本轮 run $GITHUB_RUN_ID"; exit 1; }
+          echo "✅ Release 已带本轮戳：run $GITHUB_RUN_ID · ${IMG_SIZE} B · sha256 ${IMG_SHA:0:12}…"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## TYFZA1 构建"
+            echo "- 端口锁到 \`$TYFZA1_SHA\`"
+            echo "- 基座上游锁定 \`$TYFZA1_SHA\`；追加仅三项：BTF/eBPF、honk、luci-theme-lucent"
+            echo "- 产物 Release：<https://github.com/${GITHUB_REPOSITORY}/releases/tag/tyfza1>"
+            echo "- 构建后已断言：vmlinux 含 .BTF、rootfs apk 库含 honk 三件与主题"
+          } >> "$GITHUB_STEP_SUMMARY"

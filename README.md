@@ -1,9 +1,30 @@
 # TYFZA1 专用 OpenWrt 构建仓库
 
 设备：天翼 TYFZA1（Realtek RTL9617CVW，4×Cortex-A55，XG-PON ONU，RTL8852C 5G + RTL8192XB 2.4G）。
-这个仓库只做这一台设备，和 `ponwrt-xg040gmd`（Nokia XG-040G-MD）互不影响。
+这个仓库只做这一台设备，和 `likz0421/ponwrt-xg040gmd`（Nokia XG-040G-MD）互不影响。
 
-## 为什么先跑探针而不是直接出固件
+## 两条线
+
+| 工作流 | 作用 | 产出 |
+|---|---|---|
+| `build.yml` | **出可刷固件**：端口锁 SHA + 我们那四样追加 + 全量断言 | Release `tyfza1`（滚动 tag，资产含 `sysupgrade.bin` 与 `latest.json`） |
+| `base-probe.yml` | 回答"能不能换基座（25.12.6）"，不出固件 | 各门槛的 VERDICT 与日志 |
+
+`build.yml` 的构成（不改上游任何文件，走上游自己留的 `TYFZA1_CONFIG` 扩展点）：
+
+1. 内核 BTF/eBPF + honk 需要的 TC 模块（honk 的前提）；
+2. honk：daeuniverse 官方 release 二进制（`0.1.0_beta5`，sha256 逐字核对）+ `luci-app-honk` + `luci-lib-daeuniverse`；
+3. 主题 `luci-theme-lucent`（用户自己的仓库，锁 SHA）；
+4. `ponwrt-wifi-on`：首启把射频 `disabled` 置 0，**不建 SSID、不设密码**
+   （依据 `mac80211.uc:115` 的 `disabled = defaults ? 0 : 1`，本设备 DTS 无 `wlan/defaults`）。
+
+构建里硬断言（任何一条不过就不出固件）：内核 `.BTF` 在；`kmod-rtl-ax-ap` 与
+`lib/modules/6.18.55/rtl_ax_ap.ko` 在 rootfs；镜像里 honk 版本 == manifest 钉的那版；
+主题资源文件在；`99-ponwrt-enable-radio` 在；并打印首启真实的 `/etc/config/wireless` 与
+`/etc/apk/arch`。本仓库**不发**自建 apk 源；能不能用官方/daeuniverse 的
+`aarch64_generic` 索引，由构建里的探针给 VERDICT，验过再写进固件。
+
+## 为什么先跑探针而不是直接把 25.12.6 当基座
 
 要求是"官方 25.12.6 稳定版"。实测（GitHub contents API，逐条复核过）：
 

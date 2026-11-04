@@ -1,0 +1,43 @@
+# honk 进固件的锁定参数（wrapper 包方案）
+#
+# 为什么不做源码构建：honk 的 eBPF 对象要 nightly Rust + 预编译 bpf-linker +
+# BoringSSL(Go)，且 daeuniverse/openwrt-packages 里没有那套 CI 定义（只有
+# build-vmlinux-btf.yml）；他们的 .apk 又是 ADBd 单文件格式，tar/gzip 解不开，
+# 用构建里的 host apk 解又被 package/utils/lua[host] 编译失败挡住。
+#
+# 所以：做一个真正的 in-tree 包 package/custom/honk，
+#   - 二进制取 honk 官方 release 资产（musl 静态、内嵌 doona），
+#     由 buildroot 自己下载并按 PKG_HASH 校验；
+#   - init / UCI / config.dae 从 daeuniverse 的 feed 源码里按 SHA 取；
+#   - luci-app-honk / luci-lib-daeuniverse 也从同一 feed 按 SHA 取源码，
+#     作为普通 LuCI 包编进来。
+# 结果：honk 是固件里的正常包，进 apk 数据库、可 apk upgrade、依赖齐全。
+
+HONK_VERSION=0.1.0-beta.5
+# apk 的版本号里 `-` 是 revision 分隔符，整个字符串只允许出现一次：
+# 0.1.0-beta.4-r1 会被 `apk mkpkg` 直接拒掉（"package version is invalid"，上一轮就是这）。
+# 写成下划线形式，并且和 daeuniverse 自己 Makefile 里的 PKG_VERSION 一字不差
+# （feed main 现为 `PKG_VERSION:=$(if $(HONK_VERSION),$(HONK_VERSION),0.1.0_beta5)`），
+# 这样将来从 @daeuniverse 装同名包时，版本比较不会因为我们这边排得更高而拒绝"降级"。
+HONK_PKG_VERSION=0.1.0_beta5
+HONK_ASSET=honk-core-v0.1.0-beta.5-aarch64-unknown-linux-musl-full.tar.gz
+HONK_URL=https://github.com/daeuniverse/honk/releases/download/v0.1.0-beta.5/honk-core-v0.1.0-beta.5-aarch64-unknown-linux-musl-full.tar.gz
+# 与 release 附带的 SHA256SUMS 逐字核对过（v0.1.0-beta.5 那行 6e06b12c…，
+# 与 GitHub release API 的 asset digest 也是同一串）
+HONK_SHA256=6e06b12c05f775744b4cc65f80d29ae486e65f4a433d2878b197703d8f83e7ae
+# 资产内的文件名（静态链接 ELF）
+HONK_FILE=honk-core
+
+# 三个包的来源：daeuniverse/openwrt-packages（feed 形态，源码），锁 SHA
+DAEUNIV_URL=https://github.com/daeuniverse/openwrt-packages
+# e48b222f = 上游 "build(honk): move to v0.1.0-beta.5"，与上面的二进制版本对齐；
+# 换钉前实测过 keys/public-key.pem 的 sha256 仍是下面 DAEUNIV_KEY_SHA256（没换钥匙）
+DAEUNIV_SHA=e48b222f239e2572244c8cf495fbce79b0da7528
+#   honk/files/{honk.init,honk.config,config.dae}   → 装进 wrapper 包
+#   luci-app-honk/            依赖 +luci-lib-daeuniverse +honk
+#   luci-lib-daeuniverse/     依赖 +luci-base +jshn +flock +coreutils-timeout（含 po/ 中文）
+
+# 设备侧 @daeuniverse 在线源用的验签公钥（= 上面 feed 里 keys/public-key.pem 那一份，
+# 也等于 https://openwrt.daeuniverse.org/public-key.pem）。镜像内置在
+# files/etc/apk/keys/daeuniverse.pem，构建时把内置文件与锁定 feed 的 git blob 逐字节比对。
+DAEUNIV_KEY_SHA256=5aae30568b7e08f86ea3e72a19fa281d835ba4eff8ab38849abcd2b0884c6cd5

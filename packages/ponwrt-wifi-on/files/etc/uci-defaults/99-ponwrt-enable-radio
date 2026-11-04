@@ -1,0 +1,42 @@
+#!/bin/sh
+# 首启启用射频：只把 wifi-device 的 disabled 置 0。不建 SSID、不动加密、不写密码。
+#
+# 为什么不会变成"凭空开一个开放网络"（源码依据，不是想当然）：
+#   wifi-scripts 的模板 package/network/config/wifi-scripts/files/lib/wifi/mac80211.uc
+#   给每个 radio 生成的默认 iface 是
+#       ssid = defaults?.ssid || "OpenWrt"
+#       encryption = defaults?.encryption || 'none'
+#       disabled = defaults ? 0 : 1
+#   而本设备的 DTS（端口 overlay 的 dts/）里没有任何 wlan/defaults/ssids 节点，
+#   所以那个默认 iface 的 disabled 一定是 1：射频开着、接口仍禁用，
+#   广播什么仍由你在 网络 → 无线 里配置后决定。
+#
+# /etc/config/wireless 是首启由 `wifi config` 生成的（uci-defaults 可能跑在它之前），
+# 所以这里缺文件就自己生成一次；注意 `wifi detect` 在 25.12 里已废弃并且直接
+# exit 1（wifi-scripts/files/sbin/wifi 的 wifi_detect_notice），能用的子命令是
+# config / up / down / reload / reconf，没有 "reload 配置射频" 那种写法，启用用 `wifi up`。
+#
+# uci-defaults 约定：返回非 0 就留着下次开机再跑，返回 0 才自删。
+
+. /lib/functions.sh
+
+[ -s /etc/config/wireless ] || wifi config >/dev/null 2>&1
+[ -s /etc/config/wireless ] || exit 1	# 驱动/探测还没就绪 → 下次开机重试，别白跑一次
+
+found=0
+set_device() {
+	local cfg="$1" disabled
+	uci get "wireless.$cfg.type" >/dev/null 2>&1 || return 0
+	config_get disabled "$cfg" disabled
+	[ "$disabled" = "1" ] && uci set "wireless.$cfg.disabled=0"
+	found=1
+}
+
+config_load wireless
+config_foreach set_device wifi-device
+
+[ "$found" = "1" ] || exit 1
+
+uci commit wireless
+wifi up >/dev/null 2>&1 || ubus call network reload >/dev/null 2>&1
+exit 0
