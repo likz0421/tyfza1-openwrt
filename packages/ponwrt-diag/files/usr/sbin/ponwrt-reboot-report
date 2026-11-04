@@ -1,0 +1,92 @@
+#!/bin/sh
+# 采集"为什么会自动重启"的证据。设备一重启，dmesg/logread 就没了
+# （logd 只放内存），所以这个脚本做两件事：
+#   1) 现在就看一眼：把上一次开机的内核日志里所有能指向原因的行挑出来；
+#   2) --watch：把 dmesg 的尾部定期滚到 /overlay 上的一个小文件，
+#      突然掉电/硬复位后，重启进系统仍能看到复位前最后几行。
+# 不做的事：不默认开 --watch（往 NAND 写东西要有意识地选），不改上游任何文件。
+
+OVERLAY_DIR=${OVERLAY_DIR:-/overlay/ponwrt-diag}
+LOG=$OVERLAY_DIR/last-boot.txt
+INTERVAL=${INTERVAL:-300}
+DUMP_BYTES=8192
+
+hdr() { echo; echo "===== $1"; }
+
+gather() {
+  hdr "基本信息"
+  echo "uname   : $(uname -r) $(uname -v 2>/dev/null)"
+  echo "model   : $( (cat /proc/device-tree/model 2>/dev/null | tr -d '\0') || echo 未知)"
+  echo "compat  : $( (cat /proc/device-tree/compatible 2>/dev/null | tr '\0' ' ') || echo 未知)"
+  echo "board   : $(cat /tmp/sysinfo/board_name 2>/dev/null || echo 未知)"
+  echo "uptime  : $(cut -d'.' -f1 /proc/uptime) 秒 · now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "command : $(cat /proc/cmdline 2>/dev/null)"
+
+  hdr "内存与温度"
+  grep -E 'MemAvailable|MemFree|SwapTotal|SwapFree' /proc/meminfo 2>/dev/null
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -d "$z" ] || continue
+    echo "$(basename "$z"): $(cat "$z/type" 2>/dev/null) $(cat "$z/temp" 2>/dev/null) mC"
+  done
+
+  hdr "内核日志里指向复位原因的行的"
+  dmesg 2>/dev/null | grep -inE 'panic|oops|bug|watchdog|reboot|reset|thermal|out of memory|oom|vcc|pon (loss|down)|loss of signal|register' \
+    | tail -25
+  echo "（上面这些是**本次开机**的日志；上次的只在 --watch 的文件里）"
+
+  hdr "pstore / 崩溃缓冲"
+  if [ -d /sys/fs/pstore ] && [ -n "$(ls -A /sys/fs/pstore 2>/dev/null)" ]; then
+    ls -l /sys/fs/pstore
+    head -40 /sys/fs/pstore/console-ramoops* 2>/dev/null
+  else
+    echo "没有 pstore 内容。这台机器的 DTS 里没有 ramoops 预留区，"
+    echo "所以内核崩溃的现场本来就不会留下 —— 要用 --watch 那个兜底。"
+  fi
+
+  hdr "U-Boot 环境变量里的复位线索"
+  if command -v fw_printenv >/dev/null 2>&1; then
+    fw_printenv 2>/dev/null | grep -iE 'boot|reset|fail|count|reason' | head -12
+  else
+    echo "没有 fw_printenv"
+  fi
+
+  hdr "logread（内存里，重启即失效）"
+  logread 2>/dev/null | tail -20
+}
+
+watch_loop() {
+  mkdir -p "$OVERLAY_DIR" 2>/dev/null || {
+    echo "::error::$OVERLAY_DIR 建不了（/overlay 没挂载？换 OVERLAY_DIR=/tmp/… 只会存在内存里）"
+    return 1
+  }
+  echo "开始记录：每 ${INTERVAL}s 把 dmesg 尾部 ${DUMP_BYTES} 字节写到 $LOG（覆盖写，不累积）"
+  echo "停止：kill $$"
+  while :; do
+    {
+      echo "### $(date -u '+%Y-%m-%dT%H:%M:%SZ') uptime=$(cut -d'.' -f1 /proc/uptime)s"
+      dmesg 2>/dev/null | tail -c "$DUMP_BYTES"
+    } > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+    sleep "$INTERVAL"
+  done
+}
+
+show_log() {
+  if [ -s "$LOG" ]; then
+    echo "-- 复位前留下的最后一份 dmesg（$LOG）--"
+    cat "$LOG"
+  else
+    echo "还没有记录文件（$LOG）—— 说明 --watch 没在跑过。"
+  fi
+}
+
+case "${1:-}" in
+  --watch) shift; watch_loop "$@" ;;
+  --last)  show_log ;;
+  --help|help)
+    echo "用法：$0            打印本次开机的证据"
+    echo "      $0 --watch    每隔 INTERVAL(默认300)秒把 dmesg 尾部写到 /overlay/ponwrt-diag/last-boot.txt"
+    echo "      $0 --last     打印上一次留下的那份尾部日志"
+    ;;
+  *) gather; hdr "上一次留下的记录"; show_log ;;
+esac
+exit 0

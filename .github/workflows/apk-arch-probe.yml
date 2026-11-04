@@ -93,22 +93,10 @@ jobs:
           echo "设备 apk：/$APKBIN"
           devapk() { sudo chroot "$ROOT" /usr/bin/qemu-aarch64-static "/$APKBIN" "$@"; }
 
-          # 验签要的钥匙：daeuniverse 的 + OpenWrt 25.12 官方发布钥。
-          # 官方钥从官方 25.12.6 的 rootfs 打包里取（GitHub 上的 keyring 镜像停在 2025-08，
-          # 那份里没有 openwrt-25.12.pem，别拿它当真相）。
+          # 验签要的钥匙：daeuniverse 的（官方发布钥在下面那一节从官方 rootfs 里取）。
           curl -sL -o "$ROOT/etc/apk/keys/daeuniverse.pem" \
             "https://raw.githubusercontent.com/daeuniverse/openwrt-packages/main/keys/public-key.pem"
           [ -s "$ROOT/etc/apk/keys/daeuniverse.pem" ] || echo "::warning::daeuniverse 公钥没取到"
-          curl -sL -o "$RUNNER_TEMP/official-rootfs.tar.gz" \
-            "https://downloads.openwrt.org/releases/25.12.6/targets/armsr/armv8/openwrt-25.12.6-armsr-armv8-rootfs.tar.gz"
-          if tar -tzf "$RUNNER_TEMP/official-rootfs.tar.gz" >/dev/null 2>&1; then
-            sudo tar -xzf "$RUNNER_TEMP/official-rootfs.tar.gz" -C "$ROOT" --no-same-owner \
-              --wildcards 'etc/apk/keys/*.pem' --keep-newer-files 2>/dev/null || true
-            echo "官方 rootfs 里的 apk 钥匙：$(ls "$ROOT"/etc/apk/keys/ | tr '\n' ' ')"
-            echo "官方 armv8 设备声明的架构：$(tar -xzO -f "$RUNNER_TEMP/official-rootfs.tar.gz" etc/apk/arch 2>/dev/null | tr '\n' ' ')"
-          else
-            echo "::warning::官方 rootfs 打包没拿到，官方索引那一路会因缺钥匙而验签失败 —— 那是钥匙问题，不是架构问题"
-          fi
           sudo chmod -R u+rw "$ROOT/etc/apk"
 
           ORIG_ARCH="$RUNNER_TEMP/arch.orig"
@@ -116,16 +104,61 @@ jobs:
           DEV_ARCH=$(tr '\n' ',' < "$ORIG_ARCH" | sed 's/,$//')
           echo "设备原样声明的架构：$DEV_ARCH"
 
+          # 上一轮发现：镜像里 repositories.d 还留着上游的 snapshots/aarch64_cortex-a53，
+          # 设备是 a55 —— 那些源对本设备全是"不可用"，apk update 因此非零退出。
+          # 探针要把它们挪开，只留我要验的那几个，否则分不清是架构问题还是旧默认源在捣乱。
+          sudo mkdir -p "$ROOT/tmp/probe-hold"
+          if [ -d "$ROOT/etc/apk/repositories.d" ]; then
+            echo "挪开镜像自带的源文件：$(ls "$ROOT"/etc/apk/repositories.d/ | tr '\n' ' ')"
+            sudo mv "$ROOT"/etc/apk/repositories.d/* "$ROOT/tmp/probe-hold/" 2>/dev/null || true
+          fi
+
+          # apk 自带的取波器（uclient-fetch）在 chroot 里发不出请求（EPERM），
+          # 所以索引由宿主 curl 下来，再让设备那份 apk 用 file:// 读 ——
+          # 架构可用性是 apk 自己判的，网络这一段和结论无关。
+          REPO="$RUNNER_TEMP/repos"
+          rm -rf "$REPO"; mkdir -p "$REPO"
+          fetch_idx() {
+            local name="$1" url="$2"
+            curl -sL -o "$REPO/$name.adb" "$url" || true
+            curl -sL -o "$REPO/$name.adb.asc" "$url.asc" || true
+            if [ -s "$REPO/$name.adb" ]; then
+              echo "   $name：$(wc -c < "$REPO/$name.adb") 字节（签名 $(wc -c < "$REPO/$name.adb.asc" 2>/dev/null || echo 0) 字节）"
+              return 0
+            fi
+            echo "   $name：索引没下下来（$url）"
+            return 1
+          }
+          HAVE_DAE=0; HAVE_OFF=0
+          fetch_idx dae-generic "$DAE_INDEX" && HAVE_DAE=1 || true
+          if fetch_idx off-packages "$OFF_PKGS" && fetch_idx off-luci "$OFF_LUCI"; then HAVE_OFF=1; fi
+
+          # 官方发布钥：从官方 25.12.6 的 rootfs 打包里取（GitHub 上的 keyring 镜像停在
+          # 2025-08，那里面没有 openwrt-25.12.pem，不能当真相）。
+          curl -sL -o "$RUNNER_TEMP/official-rootfs.tar.gz" \
+            "https://downloads.openwrt.org/releases/25.12.6/targets/armsr/armv8/openwrt-25.12.6-armsr-armv8-rootfs.tar.gz"
+          echo "官方 rootfs 里的钥匙与架构声明："
+          tar -tzf "$RUNNER_TEMP/official-rootfs.tar.gz" 2>/dev/null | grep -E 'etc/apk/(arch|keys)' | head -8 || true
+          sudo tar -xzf "$RUNNER_TEMP/official-rootfs.tar.gz" -C "$ROOT" --no-same-owner \
+            --wildcards '*etc/apk/keys/*' 2>/dev/null || echo "   （钥匙没解出来，官方那一路验签会失败）"
+          sudo tar -xzf "$RUNNER_TEMP/official-rootfs.tar.gz" -C "$ROOT" --no-same-owner \
+            --wildcards '*etc/apk/arch' --to-stdout 2>/dev/null | sed 's/^/   官方 armv8 的 etc\/apk\/arch = /' || true
+          echo "   现在钥匙目录：$(ls "$ROOT"/etc/apk/keys/ | tr '\n' ' ')"
+
           setup_case() {
             local tag="$1" alias="$2"
             sudo cp "$ORIG_ARCH" "$ROOT/etc/apk/arch"
             if [ -n "$alias" ]; then printf '%s\n' "$alias" | sudo tee -a "$ROOT/etc/apk/arch" >/dev/null; fi
-            printf '%s\n' \
-              "@daeuniverse $DAE_INDEX" \
-              "@openwrt-pkgs $OFF_PKGS" \
-              "@openwrt-luci $OFF_LUCI" > "$RUNNER_TEMP/repositories.list"
+            : > "$RUNNER_TEMP/repositories.list"
+            if [ "$HAVE_DAE" = 1 ]; then
+              printf '%s\n' "@daeuniverse file://$REPO/dae-generic.adb" >> "$RUNNER_TEMP/repositories.list"
+            fi
+            if [ "$HAVE_OFF" = 1 ]; then
+              printf '%s\n' "@openwrt-pkgs file://$REPO/off-packages.adb" \
+                "@openwrt-luci file://$REPO/off-luci.adb" >> "$RUNNER_TEMP/repositories.list"
+            fi
             sudo cp "$RUNNER_TEMP/repositories.list" "$ROOT/etc/apk/repositories"
-            echo "-- 用例 $tag：/etc/apk/arch = $(sudo tr '\n' ' ' < "$ROOT/etc/apk/arch")"
+            echo "-- 用例 $tag：/etc/apk/arch = [$(sudo tr '\n' ' ' < "$ROOT/etc/apk/arch")]，源 $(wc -l < "$RUNNER_TEMP/repositories.list") 条"
           }
 
           # 三个探针包：honk 只在 daeuniverse 有；curl 在官方 packages；luci-app-ddns 在官方 luci。
@@ -133,8 +166,9 @@ jobs:
           probe_pkg() {
             local p="$1" out n
             out="$( { devapk search -a -- "$p" 2>&1 || true; }; { devapk policy -- "$p" 2>&1 || true; }; { devapk add --simulate -- "$p" 2>&1 || true; } )"
+            printf '%s\n' "$out" | sed 's/^/         | /' | head -6
             n="$(printf '%s\n' "$out" | grep -c -- "${p}-[0-9]" || true)"
-            echo "     $(printf '%-14s' "$p") 候选=$n  $( { printf '%s\n' "$out" | grep -m1 -- "${p}-[0-9]"; } || { printf '%s\n' "$out" | grep -m1 -iE 'no such package|ERROR'; } || echo '(无输出)')"
+            echo "     $(printf '%-14s' "$p") 候选=$n"
             HIT="$n"
           }
 
@@ -142,12 +176,15 @@ jobs:
           for tag in A B; do
             if [ "$tag" = A ]; then setup_case A ""; else setup_case B "aarch64_generic"; fi
             log="$RUNNER_TEMP/update-$tag.log"
-            if devapk update > "$log" 2>&1; then
-              echo "   [$tag] apk update 跑通（$(wc -l < "$log") 行输出）"
+            devapk update > "$log" 2>&1 || true
+            echo "   [$tag] update 退出码无关，看汇总与逐行输出："
+            tail -3 "$log" | sed 's/^/         > /' || true
+            echo "   [$tag] 钥匙/验签相关行数：$(grep -icE 'sign|unsigned|public key|avrfy|verification' "$log" || true)"
+            if grep -qE '^[0-9]+ \(of [0-9]+\)|distinct packages available' "$log"; then
               if [ "$tag" = A ]; then A_OK=1; else B_OK=1; fi
             else
-              echo "   [$tag] apk update 没跑通 —— 这是探针环境/钥匙的问题，不能当成索引或架构的结论："
-              tail -6 "$log" || true
+              echo "   [$tag] 这一路的 update 输出不成话 —— 是探针环境的问题，不能当成索引或架构的结论："
+              head -8 "$log" | sed 's/^/         ! /' || true
             fi
             for p in honk curl luci-app-ddns; do
               probe_pkg "$p"

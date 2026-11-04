@@ -53,6 +53,8 @@ cp "$BASE" "$OUTCFG"
 	echo 'CONFIG_PACKAGE_luci-theme-lucent=y'
 	# 开机启用射频（不建 SSID）：上游只设 country，默认无线是关的
 	echo 'CONFIG_PACKAGE_ponwrt-wifi-on=y'
+	# 自动重启取证脚本（用户报"固件不稳定容易自动重启"，先让失败能自己说清楚）
+	echo 'CONFIG_PACKAGE_ponwrt-diag=y'
 } >> "$OUTCFG"
 # 先放到位，让后面的索引自检能跑（build.sh 里 sync-overlay 会用同一份内容再覆盖一次，幂等）
 cp "$OUTCFG" "$T/.config"
@@ -102,6 +104,18 @@ rm -rf "$T/package/custom/ponwrt-wifi-on"
 cp -a "$WIFIPKG" "$T/package/custom/ponwrt-wifi-on"
 echo "✅ 已放置 ponwrt-wifi-on（首启启用射频，不建 SSID）"
 
+# ---------- 2c. 自动重启取证脚本 ----------
+DIAGPKG="$CTRL/packages/ponwrt-diag"
+[ -s "$DIAGPKG/Makefile" ] && [ -s "$DIAGPKG/files/usr/sbin/ponwrt-reboot-report" ] || {
+	echo "::error::找不到 $DIAGPKG（Makefile 或 ponwrt-reboot-report 缺失）"; exit 1; }
+grep -q 'call BuildPackage' "$DIAGPKG/Makefile" || {
+	echo "::error::ponwrt-diag 的 Makefile 缺 call BuildPackage 扫描标记"; exit 1; }
+sh -n "$DIAGPKG/files/usr/sbin/ponwrt-reboot-report" || {
+	echo "::error::ponwrt-reboot-report 语法不过（BusyBox ash 直接跑它）"; exit 1; }
+rm -rf "$T/package/custom/ponwrt-diag"
+cp -a "$DIAGPKG" "$T/package/custom/ponwrt-diag"
+echo "✅ 已放置 ponwrt-diag（/usr/sbin/ponwrt-reboot-report）"
+
 # ---------- 3. honk：复用与 XG 线完全同一套（同一 manifest、同一 wrapper）----------
 bash "$CTRL/scripts/stage-honk.sh" "$T"
 
@@ -111,5 +125,7 @@ grep -qx "Package: luci-theme-lucent" tmp/.packageinfo || {
 	echo "::error::luci-theme-lucent 没进 tmp/.packageinfo"; exit 1; }
 grep -qx "Package: ponwrt-wifi-on" tmp/.packageinfo || {
 	echo "::error::ponwrt-wifi-on 没进 tmp/.packageinfo"; exit 1; }
-echo "✅ 索引确认: luci-theme-lucent, ponwrt-wifi-on"
-echo "✅ TYFZA1 注入完成（$OUTCFG + package/custom/{honk,luci-app-honk,luci-lib-daeuniverse,luci-theme-lucent,ponwrt-wifi-on}）"
+grep -qx "Package: ponwrt-diag" tmp/.packageinfo || {
+	echo "::error::ponwrt-diag 没进 tmp/.packageinfo（扫描标记或路径不对）"; exit 1; }
+echo "✅ 索引确认: luci-theme-lucent, ponwrt-wifi-on, ponwrt-diag"
+echo "✅ TYFZA1 注入完成（$OUTCFG + package/custom/{honk,luci-app-honk,luci-lib-daeuniverse,luci-theme-lucent,ponwrt-wifi-on,ponwrt-diag}）"
