@@ -121,10 +121,11 @@ jobs:
         run: |
           set -uo pipefail
           chmod +x "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh"
+          # runner 用 `bash -e {0}` 执行 run 块：任何非 0 都会当场中止，`rc=$?` 那行
+          # 根本活不到（上一轮三个探针就是这么把日志吞掉的）。必须用 && / || 形态取状态码。
           bash "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh" \
-            "$WORK/sources/openwrt" "$WORK/port" > "$WORK/overlay.log" 2>&1
-          rc=$?
-          cat "$WORK/overlay.log"
+            "$WORK/sources/openwrt" "$WORK/port" > "$WORK/overlay.log" 2>&1 && rc=0 || rc=$?
+          cat "$WORK/overlay.log" || true
           if [ "$rc" = 2 ]; then
             echo "OVERLAY_VERDICT=补丁打不上（详见上面逐条）"
             echo "::error::端口在 $PROBE_REF 上有补丁打不上"
