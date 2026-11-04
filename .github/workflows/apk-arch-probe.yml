@@ -61,7 +61,11 @@ jobs:
           curl -sL -o "$RUNNER_TEMP/rootfs.squashfs" "$ROOTFS_URL"
           test -s "$RUNNER_TEMP/rootfs.squashfs" || { echo "::error::下载失败"; exit 1; }
           echo "rootfs.squashfs $(wc -c < "$RUNNER_TEMP/rootfs.squashfs") 字节"
-          unsquashfs -d "$RUNNER_TEMP/root" -q "$RUNNER_TEMP/rootfs.squashfs"
+          # 非 root 解包时 unsquashfs 建不了 dev/console 这个字符设备，会**以 exit 2 结束**
+          # —— 上一次这条就是这么挂的，而它其实已经解出 3526/3527 个文件。
+          # 用 sudo 解（能建节点），再把所有权还给 runner，下一步才复制得动。
+          sudo unsquashfs -d "$RUNNER_TEMP/root" -q "$RUNNER_TEMP/rootfs.squashfs"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/root"
           for f in etc/apk/arch lib/apk/db/installed; do
             [ -s "$RUNNER_TEMP/root/$f" ] || { echo "::error::rootfs 里没有 $f"; find "$RUNNER_TEMP/root/etc/apk" "$RUNNER_TEMP/root/lib/apk" | head -10; exit 1; }
           done
