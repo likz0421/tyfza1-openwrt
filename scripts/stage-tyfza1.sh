@@ -51,6 +51,11 @@ cp "$BASE" "$OUTCFG"
 	echo 'CONFIG_PACKAGE_flock=y'
 	echo 'CONFIG_PACKAGE_coreutils-timeout=y'
 	echo 'CONFIG_PACKAGE_luci-theme-lucent=y'
+	# 上游 boot.config 只有 CONFIG_VERSIONOPT=y、没写 CONFIG_VERSION_REPO，于是每次
+	# make defconfig 都用 Kconfig 默认的官方 snapshots 把值补回去（sync-overlay 里
+	# 改一次没用，步骤 12 的对照实验会重铺 .config）。在派生 config 里显式写死，
+	# 无论 defconfig 跑几轮都保持 25.12.6 稳定版。
+	echo 'CONFIG_VERSION_REPO="https://downloads.openwrt.org/releases/25.12.6"'
 	# 开机启用射频（不建 SSID）：上游只设 country，默认无线是关的
 	echo 'CONFIG_PACKAGE_ponwrt-wifi-on=y'
 	# 自动重启取证脚本（用户报"固件不稳定容易自动重启"，先让失败能自己说清楚）
