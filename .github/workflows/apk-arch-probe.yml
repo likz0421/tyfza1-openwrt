@@ -116,7 +116,9 @@ jobs:
           # apk 自带的取波器（uclient-fetch）在 chroot 里发不出请求（EPERM），
           # 所以索引由宿主 curl 下来，再让设备那份 apk 用 file:// 读 ——
           # 架构可用性是 apk 自己判的，网络这一段和结论无关。
-          REPO="$RUNNER_TEMP/repos"
+          # file:// URL 是在 chroot 里解析的，必须是 chroot 内的路径；把索引直接下到
+          # rootfs 的 /tmp/probe-index 下（宿主侧 $ROOT/tmp/probe-index，chroot 内 /tmp/probe-index）。
+          REPO="$ROOT/tmp/probe-index"
           rm -rf "$REPO"; mkdir -p "$REPO"
           fetch_idx() {
             local name="$1" url="$2"
@@ -151,11 +153,11 @@ jobs:
             if [ -n "$alias" ]; then printf '%s\n' "$alias" | sudo tee -a "$ROOT/etc/apk/arch" >/dev/null; fi
             : > "$RUNNER_TEMP/repositories.list"
             if [ "$HAVE_DAE" = 1 ]; then
-              printf '%s\n' "@daeuniverse file://$REPO/dae-generic.adb" >> "$RUNNER_TEMP/repositories.list"
+              printf '%s\n' "@daeuniverse file:///tmp/probe-index/dae-generic.adb" >> "$RUNNER_TEMP/repositories.list"
             fi
             if [ "$HAVE_OFF" = 1 ]; then
-              printf '%s\n' "@openwrt-pkgs file://$REPO/off-packages.adb" \
-                "@openwrt-luci file://$REPO/off-luci.adb" >> "$RUNNER_TEMP/repositories.list"
+              printf '%s\n' "@openwrt-pkgs file:///tmp/probe-index/off-packages.adb" \
+                "@openwrt-luci file:///tmp/probe-index/off-luci.adb" >> "$RUNNER_TEMP/repositories.list"
             fi
             sudo cp "$RUNNER_TEMP/repositories.list" "$ROOT/etc/apk/repositories"
             echo "-- 用例 $tag：/etc/apk/arch = [$(sudo tr '\n' ' ' < "$ROOT/etc/apk/arch")]，源 $(wc -l < "$RUNNER_TEMP/repositories.list") 条"

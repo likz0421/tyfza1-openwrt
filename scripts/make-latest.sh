@@ -50,4 +50,4 @@ for (const [k, v] of Object.entries(o)) {
 }
 fs.writeFileSync(process.env.OUTFILE, JSON.stringify(o, null, 2) + "\n");
 console.log("latest.json：" + Object.keys(o).length + " 个字段 · " + o.firmware + " " + (o.size_bytes || "?") + " B · sha256 " + String(o.sha256).slice(0, 12) + "…");
-' OUTFILE="$OUT/latest.json"
+'

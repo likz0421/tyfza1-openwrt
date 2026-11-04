@@ -58,7 +58,9 @@ cp "$BASE" "$OUTCFG"
 } >> "$OUTCFG"
 # 先放到位，让后面的索引自检能跑（build.sh 里 sync-overlay 会用同一份内容再覆盖一次，幂等）
 cp "$OUTCFG" "$T/.config"
-echo "✅ 派生 config：上游 $(grep -c '^CONFIG_' "$BASE") 条 + 我们追加 $(grep -c '^CONFIG_' "$OUTCFG") 条总量"
+UP_N=$(grep -c '^CONFIG_' "$BASE" || true)
+ALL_N=$(grep -c '^CONFIG_' "$OUTCFG" || true)
+echo "✅ 派生 config：上游 $UP_N 条 + 我们追加 $((ALL_N - UP_N)) 条 = $ALL_N 条总量"
 
 # ---------- 1b. 先装 luci feed（必须在放 LuCI 包之前）----------
 # luci-app-honk / luci-lib-daeuniverse / 主题的 Makefile 都 include
@@ -66,7 +68,11 @@ echo "✅ 派生 config：上游 $(grep -c '^CONFIG_' "$BASE") 条 + 我们追�
 # prepare_luci_feeds.sh，那时我们的包还没进树，自检就会因 luci.mk 不存在而 dump 失败。
 # 这里先调他们自己的脚本（幂等，build.sh 再跑一次无影响），不自己拼 feeds 命令。
 FEEDPREP=""
-for c in "$PORT/scripts/prepare_luci_feeds.sh" "$PORT/../scripts/prepare_luci_feeds.sh"; do
+# 端口仓库的脚本在 <repo>/port/scripts/ 下（和 build.sh / sync-overlay.sh 同层）；
+# 旧的两个候选都不在这个位置，会每轮走到 exit 1。三个位置都试，先命中先用。
+for c in "$PORT/port/scripts/prepare_luci_feeds.sh" \
+         "$PORT/scripts/prepare_luci_feeds.sh" \
+         "$PORT/../scripts/prepare_luci_feeds.sh"; do
 	[ -f "$c" ] && { FEEDPREP="$c"; break; }
 done
 [ -n "$FEEDPREP" ] || { echo "::error::找不到 prepare_luci_feeds.sh，luci.mk 将不存在"; exit 1; }

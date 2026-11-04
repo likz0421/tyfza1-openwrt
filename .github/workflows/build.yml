@@ -3,8 +3,9 @@ name: build
 # ============================================================
 # TYFZA1（Realtek RTL9617C，4×Cortex-A55，Linux 6.18.55）专用构建线：本仓库只做这一台设备。
 #   端口与基座按 SHA 锁在 pins.env（不 fork 任何人）。
-#   我们只额外加四样：内核 BTF/eBPF 前提、honk（daeuniverse 官方 release 二进制 + LuCI 前端）、
-#   用户自己的 luci-theme-lucent、以及"首启启用射频不广播"的小包；其余一律沿用上游行为。
+#   我们只额外加五样：内核 BTF/eBPF 前提、honk（daeuniverse 官方 release 二进制 + LuCI 前端）、
+#   用户自己的 luci-theme-lucent、"首启启用射频不广播"的小包、以及重启取证脚本；
+#   其余一律沿用上游行为。
 #   与 base-probe.yml 的分工：这条线出可刷固件，那条回答"能不能换 25.12.6 基座"。
 # ============================================================
 
@@ -512,7 +513,7 @@ jobs:
               "$(grep -c '^P:' "$db")" "$(grep -cE '^P:honk$' "$db")" "$(grep -cE '^P:luci-theme-lucent$' "$db")"
           done
           MISS=""
-          for p in honk luci-app-honk luci-lib-daeuniverse luci-theme-lucent kmod-sched-core kmod-nft-queue kmod-nfnetlink-queue v2ray-geosite; do
+          for p in honk luci-app-honk luci-lib-daeuniverse luci-theme-lucent ponwrt-wifi-on ponwrt-diag kmod-sched-core kmod-nft-queue kmod-nfnetlink-queue v2ray-geosite; do
             grep -qsE "^P:$p$" $DBS || MISS="$MISS $p"
           done
           [ -z "$MISS" ] || { echo "::error::所有 rootfs 里都没有这些包:$MISS"; exit 1; }
@@ -534,7 +535,8 @@ jobs:
           echo "  kmod-rtl-ax-ap 在：$WK"
           echo "  该 rootfs 里 WiFi 相关包：$(grep -oE '^P:[A-Za-z0-9._+-]+' "$WK/lib/apk/db/installed" | cut -c3- | grep -iE 'rtl|80211|wpad|wifi|regdb|^iw$' | tr '\n' ' ')"
           KO=$(find "$WK/lib/modules" -name 'rtl_ax_ap.ko*' 2>/dev/null | head -1)
-          [ -n "$KO" ] && echo "  驱动文件：$KO" || echo "::warning::rootfs 里没找到 rtl_ax_ap.ko（包记录了但文件没落地？检查 KernelPackage FILES）"
+          [ -n "$KO" ] || { echo "::error::rootfs 里没找到 rtl_ax_ap.ko（包记录了但文件没落地？检查 KernelPackage FILES）"; exit 1; }
+          echo "  驱动文件：$KO"
           echo "=== 3) 实体文件（同样按并集找）==="
           MISSBIN=""
           for f in usr/bin/honk-core etc/init.d/honk; do
@@ -602,16 +604,22 @@ jobs:
       # 只出结论不红作业：结论没拿到之前，不往固件里塞一条可能 404 的源。
 
       - name: Probe whether a third-party aarch64_generic index is usable
+        id: apkprobe
         run: |
           set -euo pipefail
           T="$TYFZA1_WORK/sources/openwrt"
           DEV_ARCH=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' "$T/.config")
-          ROOT=$(find "$T/build_dir" -maxdepth 3 -type d -name 'root-rtl9617c' 2>/dev/null | head -1 || true)
+          # 和成品断言用同一套判据：按 apk 库找 rootfs，不按目录名猜
+          #（root-rtl9617c 这单个目录不一定覆盖全部镜像，猜错就拿不到合法 apk db）
+          ROOT=$(find "$T/build_dir" -maxdepth 7 -type f -path '*/lib/apk/db/installed' \
+            -printf '%h\n' 2>/dev/null | sed 's|/lib/apk/db$||' | head -1 || true)
           # 沙箱必须用真实 rootfs 里的合法 apk 数据库：我上一版手搓了空的
           # installed/world，apk 报 "Unable to read database" 是沙箱不完整，
           # 我却把它当成"架构不兼容"的结论 —— 双重假结论，这里从根上改掉。
           if [ -z "${ROOT:-}" ] || [ ! -s "$ROOT/lib/apk/db/installed" ]; then
-            echo "::error::找不到真实 rootfs 或其 apk 库（ROOT=${ROOT:-空}），探针无法进行"; exit 1
+            echo "::error::找不到真实 rootfs 或其 apk 库（ROOT=${ROOT:-空}），探针无法进行"
+            echo "verdict=inconclusive" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "沙箱数据源：$ROOT/lib/apk/db/installed（$(wc -c < "$ROOT/lib/apk/db/installed") 字节）"
           echo "设备声明的架构：$(tr '\n' ' ' < "$ROOT/etc/apk/arch")"
@@ -648,16 +656,31 @@ jobs:
             if [ -f "$PROBE/$c" ]; then APKBIN="$c"; break; fi
           done
           if [ -z "${APKBIN:-}" ]; then
-            echo "::error::复制出来的 rootfs 里没有 apk 二进制，探针做不了（不下结论）"; exit 0
+            echo "::error::复制出来的 rootfs 里没有 apk 二进制，探针做不了（不下结论）"
+            echo "verdict=inconclusive" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "设备 apk：/$APKBIN（host apk 那份只是参考：$([ -x "$APK" ] && "$APK" --version 2>&1 | head -1 || echo 无)）"
           devapk() { sudo chroot "$PROBE" /usr/bin/qemu-aarch64-static "/$APKBIN" "$@"; }
           cp "$GITHUB_WORKSPACE/files/etc/apk/keys/daeuniverse.pem" "$PROBE/etc/apk/keys/" 2>/dev/null || \
             echo "::warning::daeuniverse 公钥没进钥匙目录，验签会失败（那是钥匙问题，不是架构问题）"
-          printf '%s\n' "@daeuniverse https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb" \
-            > "$PROBE/etc/apk/repositories"
+          # chroot 里 uclient-fetch 发不出请求（EPERM）：索引由宿主 curl 下到
+          # chroot 内可见的 /tmp/probe-index，再让设备那份 apk 用 file:// 读。
+          # URL 必须是 chroot 内的路径 —— 写宿主绝对路径会 100% 读不到。
+          IDXC=/tmp/probe-index
+          mkdir -p "$PROBE$IDXC"
+          DAE_ADB="https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb"
+          curl -fsSL --retry 3 -o "$PROBE$IDXC/dae-generic.adb" "$DAE_ADB" || true
+          curl -fsSL --retry 3 -o "$PROBE$IDXC/dae-generic.adb.asc" "$DAE_ADB.asc" || true
+          [ -s "$PROBE$IDXC/dae-generic.adb" ] || echo "::warning::generic 索引没下下来，探针不下结论"
+          # 镜像自带的 snapshots/a53 源对 a55 全不可用，不挪开 apk update 必非零
+          mkdir -p "$PROBE/tmp/probe-hold"
+          if [ -d "$PROBE/etc/apk/repositories.d" ]; then
+            mv "$PROBE"/etc/apk/repositories.d/* "$PROBE/tmp/probe-hold/" 2>/dev/null || true
+          fi
+          printf '%s\n' "@daeuniverse file://$IDXC/dae-generic.adb" > "$PROBE/etc/apk/repositories"
           cp "$PROBE/etc/apk/arch" "$TYFZA1_WORK/arch.orig"
-          A_HITS=0; B_HITS=0
+          A_HITS=0; B_HITS=0; UPDATE_OK=0
           probe_case() {
             local name="$1" alias="$2" q n
             cp "$TYFZA1_WORK/arch.orig" "$PROBE/etc/apk/arch"
@@ -668,6 +691,7 @@ jobs:
               tail -6 "$TYFZA1_WORK/probe-$name.log" || true
               return 0
             fi
+            UPDATE_OK=$((UPDATE_OK + 1))
             echo "   update 输出：$(head -3 "$TYFZA1_WORK/probe-$name.log" | tr '\n' ' ')"
             q="$({ devapk search -a honk 2>&1 || true; }; { devapk policy honk 2>&1 || true; }; { devapk add --simulate honk 2>&1 || true; })"
             printf '%s\n' "$q" | grep -i 'honk' | head -6
@@ -678,14 +702,22 @@ jobs:
           }
           probe_case A ""
           probe_case B "aarch64_generic"
-          echo "VERDICT：设备原样 $DEV_ARCH 命中 ${A_HITS:-0} 个候选；追加 aarch64_generic 别名后命中 ${B_HITS:-0} 个"
-          if [ "${A_HITS:-0}" -gt 0 ]; then
-            echo "VERDICT: daeuniverse 的 generic 索引设备原样就能吃 —— 可以写成设备源"
+          echo "VERDICT：设备原样 $DEV_ARCH 命中 ${A_HITS:-0} 个；追加别名后 ${B_HITS:-0} 个（update 跑通 ${UPDATE_OK:-0}/2 组）"
+          if [ "${UPDATE_OK:-0}" -lt 2 ]; then
+            V=inconclusive
+            echo "VERDICT: 探针环境没跑通，不下结论（不能当成索引不可用）"
+          elif [ "${A_HITS:-0}" -gt 0 ]; then
+            V=ok
+            echo "VERDICT: generic 索引设备原样就能吃 —— 交付可直接用的源配置脚本"
           elif [ "${B_HITS:-0}" -gt 0 ]; then
-            echo "VERDICT: 要把 aarch64_generic 写进 /etc/apk/arch 才吃得到 —— 混装风险要先评估"
+            V=needs-alias
+            echo "VERDICT: 要写 aarch64_generic 别名才吃得到 —— 配置脚本会加这一行"
           else
-            echo "VERDICT: 两组都 0 候选（且 update 跑通了才算数）—— generic 这条路对 a55 不通"
+            V=unavailable
+            echo "VERDICT: 两组都 0 候选 —— generic 这条路对 a55 不通，交付的脚本不写任何源"
           fi
+          echo "verdict=$V" >> "$GITHUB_OUTPUT"
+          echo "### apk 源探针：$V（A=${A_HITS:-0} B=${B_HITS:-0} update_ok=${UPDATE_OK:-0}/2）" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package release artifacts
         run: |
@@ -695,6 +727,22 @@ jobs:
           sh scripts/package_release.sh sources/openwrt artifacts/release
           ls -la artifacts/release
           (cd artifacts/release && sha256sum * 2>/dev/null | tee SHA256SUMS.local)
+          # latest.json 的 sha256sums_url 指向不带 .local 的正式资产名，这里真的产出同名文件。
+          (cd artifacts/release && cp SHA256SUMS.local SHA256SUMS)
+
+      - name: Generate device apk repo setup from the probe verdict
+        env:
+          PROBE_VERDICT: ${{ steps.apkprobe.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          V="${PROBE_VERDICT:-inconclusive}"
+          echo "本轮 apk 架构探针结论：$V"
+          # 探针跑在编译之后，镜像已打包，写 files/ 进不了本轮固件；
+          # 按结论生成一个随 Release 交付的设备端脚本，结论不成立时它不写任何源。
+          bash "$GITHUB_WORKSPACE/scripts/make-apk-setup.sh" \
+            "$TYFZA1_WORK/artifacts/release/setup-apk-repos.sh" "$V"
+          echo "PROBE_VERDICT=$V" >> "$GITHUB_ENV"
+          (cd "$TYFZA1_WORK/artifacts/release" && sha256sum setup-apk-repos.sh >> SHA256SUMS)
 
       - name: Build stamp for the release text
         # 滚动 tag 的 published_at 永远停在首次发布那一刻，资产又是同名覆盖重建，
@@ -724,22 +772,25 @@ jobs:
             ## 本次构建（run ${{ github.run_id }}）
             - 时间：${{ env.BUILD_STAMP }}
             - `${{ env.IMG_NAME }}`：**${{ env.IMG_SIZE }} B**，sha256 `${{ env.IMG_SHA }}`
-            - WiFi 驱动：`/lib/modules/6.18.55/rtl_ax_ap.ko`（kmod-rtl-ax-ap 内含
+            - WiFi 驱动：`/lib/modules/*/rtl_ax_ap.ko`（kmod-rtl-ax-ap 内含
               cfg80211/mac80211/rtl_ax_ap 三个 .ko）必须在镜像里，成品断言会验。
             - 下面的资产每次构建都**同名覆盖重建**；滚动 tag 不改 published_at，
               所以卡片日期看着像旧的 —— 认新旧看这里的构建时间和 sha256。
 
             基座完全按上游：<https://github.com/LeoooChen/PonWRT-TYFZA1@${{ env.TYFZA1_SHA }}>
             （按 SHA 取，非 fork；其 sources.lock.json 锁的 openwrt commit + kernel 6.18.55）。
-            只额外加四样，且不改上游任何文件（用他们自己留的 TYFZA1_CONFIG 扩展点派生 config）：
+            只额外加五样，且不改上游任何文件（用他们自己留的 TYFZA1_CONFIG 扩展点派生 config）：
             1. 内核 BTF + honk 需要的 eBPF/TC 模块
             2. honk（daeuniverse）：官方 release 静态二进制包 + luci-app-honk + luci-lib-daeuniverse
             3. 主题 luci-theme-lucent（argon 仍在，按上游要求保留）
             4. ponwrt-wifi-on：首启把射频 disabled 置 0，**不建 SSID、不设密码**
                （依据：mac80211.uc 的默认 iface 是 disabled=defaults?0:1，本设备 DTS 无 wlan/defaults）
+            5. ponwrt-diag：/usr/sbin/ponwrt-reboot-report，重启后手动取证（默认不常驻）
             软件源：本仓库**不发**自建 apk 仓库 —— 设备是 aarch64_cortex-a55，官方与 daeuniverse
             都没有该架构索引，只有 aarch64_generic；能否使用由本次构建的探针给结论
-            （看日志里 "VERDICT" 那几行），验过再写进固件，不放一条 404 的源进去。
+            （看日志里 "VERDICT" 那几行）。探针跑在编译之后、镜像已打包，所以按结论生成
+            `setup-apk-repos.sh` 随本 Release 交付：刷机后跑一次即可；结论不成立时它不写任何源，
+            不会塞一条 404 进设备。结论同时写进 `latest.json` 的 `apk_probe` 字段。
             认新旧：资产里的 latest.json（run_id / sha256 / built_at_local），URL 随 tag 固定。
             RTL9617C 与 AN7581 是不同 target，本产物只用于 TYFZA1。
             刷入见上游 README：先装他们的原生 U-Boot，恢复页 http://192.168.0.1。
@@ -771,13 +822,17 @@ jobs:
             firmware_url="https://github.com/$GITHUB_REPOSITORY/releases/download/tyfza1/$IMG_NAME" \
             sha256sums_url="https://github.com/$GITHUB_REPOSITORY/releases/download/tyfza1/SHA256SUMS" \
             wifi_driver=kmod-rtl-ax-ap \
+            apk_probe="${PROBE_VERDICT:-inconclusive}" \
             upstream_sha="$TYFZA1_SHA" \
             notes="判断新旧只看 sha256 与 built_at_local；滚动 tag 不改 published_at"
           # 指针本身也当资产传上去：URL 随 tag 固定，人和脚本都只问一个地址。
           # 上一版这一步只 cp 到工作区、没真上传（步骤名却写着 Publish）——
           # 所以这次传完立刻读回 API 验，传不上去就红，不留"名字骗人"的空间。
           cp "$TYFZA1_WORK/pointer/latest.json" ./latest.json
-          gh release upload tyfza1 latest.json --clobber
+          sha256sum latest.json >> SHA256SUMS
+          # SHA256SUMS 在上一步已经随 Release 上传过，这里追加了 latest.json 的哈希，
+          # 必须一起重传，否则 Release 上的清单和本地文件不一致。
+          gh release upload tyfza1 latest.json SHA256SUMS --clobber
           sleep 3
           got=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                   "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/tyfza1" \
@@ -809,7 +864,7 @@ jobs:
           {
             echo "## TYFZA1 构建"
             echo "- 端口锁到 \`$TYFZA1_SHA\`"
-            echo "- 基座上游锁定 \`$TYFZA1_SHA\`；追加仅三项：BTF/eBPF、honk、luci-theme-lucent"
+            echo "- 基座上游锁定 \`$TYFZA1_SHA\`；追加五项：BTF/eBPF、honk、luci-theme-lucent、ponwrt-wifi-on、ponwrt-diag"
             echo "- 产物 Release：<https://github.com/${GITHUB_REPOSITORY}/releases/tag/tyfza1>"
             echo "- 构建后已断言：vmlinux 含 .BTF、rootfs apk 库含 honk 三件与主题"
           } >> "$GITHUB_STEP_SUMMARY"

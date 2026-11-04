@@ -7,7 +7,7 @@
 
 | 工作流 | 作用 | 产出 |
 |---|---|---|
-| `build.yml` | **出可刷固件**：端口锁 SHA + 我们那四样追加 + 全量断言 | Release `tyfza1`（滚动 tag，资产含 `sysupgrade.bin` 与 `latest.json`） |
+| `build.yml` | **出可刷固件**：端口锁 SHA + 我们那五样追加 + 全量断言 | Release `tyfza1`（滚动 tag，资产含 `sysupgrade.bin`、`latest.json`、`SHA256SUMS`、`setup-apk-repos.sh`） |
 | `base-probe.yml` | 回答"能不能换基座（25.12.6）"，不出固件 | 各门槛的 VERDICT 与日志 |
 
 `build.yml` 的构成（不改上游任何文件，走上游自己留的 `TYFZA1_CONFIG` 扩展点）：
@@ -16,13 +16,15 @@
 2. honk：daeuniverse 官方 release 二进制（`0.1.0_beta5`，sha256 逐字核对）+ `luci-app-honk` + `luci-lib-daeuniverse`；
 3. 主题 `luci-theme-lucent`（用户自己的仓库，锁 SHA）；
 4. `ponwrt-wifi-on`：首启把射频 `disabled` 置 0，**不建 SSID、不设密码**
-   （依据 `mac80211.uc:115` 的 `disabled = defaults ? 0 : 1`，本设备 DTS 无 `wlan/defaults`）。
+   （依据 `mac80211.uc:115` 的 `disabled = defaults ? 0 : 1`，本设备 DTS 无 `wlan/defaults`）；
+5. `ponwrt-diag`：`/usr/sbin/ponwrt-reboot-report`，重启后手动取证（默认不常驻）。
 
 构建里硬断言（任何一条不过就不出固件）：内核 `.BTF` 在；`kmod-rtl-ax-ap` 与
-`lib/modules/6.18.55/rtl_ax_ap.ko` 在 rootfs；镜像里 honk 版本 == manifest 钉的那版；
+`rtl_ax_ap.ko` 在 rootfs 的 `/lib/modules/*/` 下；镜像里 honk 版本 == manifest 钉的那版；
 主题资源文件在；`99-ponwrt-enable-radio` 在；并打印首启真实的 `/etc/config/wireless` 与
 `/etc/apk/arch`。本仓库**不发**自建 apk 源；能不能用官方/daeuniverse 的
-`aarch64_generic` 索引，由构建里的探针给 VERDICT，验过再写进固件。
+`aarch64_generic` 索引，由构建里的探针给 VERDICT，并按结论生成 `setup-apk-repos.sh`
+随 Release 交付（探针在编译之后跑，镜像已打包，无法回写本轮固件）。
 
 ## 为什么先跑探针而不是直接把 25.12.6 当基座
 
@@ -61,8 +63,10 @@ GitHub 上 tyfza1/rtl9617c 的公开仓库搜索命中就是上面这些，没�
 
 设备是 `aarch64_cortex-a55`，官方与 daeuniverse 都**不发**这个架构的索引，只有
 `aarch64_generic`。能否让 a55 设备直接使用 generic 索引，取决于 apk 的架构匹配 ——
-我不猜：由构建打印镜像里真实的 `/etc/apk/arch` 并用 host apk 实跑 `apk update` 给结论，
-验过才写进固件；验不过我会把原因贴出来并给替代方案，而不是默默塞一条永远 404 的源。
+我不猜：构建在设备自己的 rootfs 里用 chroot + qemu 跑它自带的 apk（不是宿主那代
+apk-tools），打印真实的 `/etc/apk/arch` 并实跑 `apk update` 给结论；结论通过
+`GITHUB_OUTPUT` 传给后续步骤，生成 `setup-apk-repos.sh` 作为 Release 资产。
+探针环境没跑通时结论是 `inconclusive`，脚本不写任何源，而不是默默塞一条 404。
 
 ## 第一轮实测结论（2026-11-04，run 41780375123 / 41780378961 / 41780383259）
 
@@ -78,5 +82,7 @@ GitHub 上 tyfza1/rtl9617c 的公开仓库搜索命中就是上面这些，没�
 
 ## 已知风险（另开一条任务跟踪）
 
-设备出现非预期自动重启。**没有重启前的日志不修**：本仓库的固件默认带崩溃取证
-（pstore/ramoops + 日志持久化 + 看门狗来源审计），先拿到证据再定位。
+设备出现非预期自动重启。**没有重启前的日志不修**：固件带 `ponwrt-diag`
+（`/usr/sbin/ponwrt-reboot-report`，手动运行或按需 `--watch` 常驻，往 /overlay 滚存 dmesg 尾部）。
+注意本设备 DTS **没有 ramoops 预留区**，内核 panic 现场本来就留不下来，pstore 通常是空的；
+所以先从持久日志与看门狗线索查起，别指望 pstore/ramoops。
