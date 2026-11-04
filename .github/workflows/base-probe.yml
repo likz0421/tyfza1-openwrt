@@ -262,7 +262,10 @@ jobs:
               # 一轮拿全不兼容补丁清单：make 遇到第一个打不上的补丁就停，
               # 逐个 dry-run 才能避免每 40 分钟只暴露一个。
               TREE="$PWD"
-              KSRC=$(find build_dir -maxdepth 6 -type d -name "linux-$PROBE_KV.*" 2>/dev/null | head -1 || true)
+              # 必须只认 target 目录下真正编内核的那棵树；find 取第一个 linux-* 会
+              # 选中 toolchain-*/linux-6.12.112（只有头文件），那上面的 dry-run 全是假 INCOMPAT。
+              KSRC=$(find build_dir -maxdepth 7 -type d \
+                -path "*/target-*/linux-rtl9617c_generic/linux-$PROBE_KV.*" 2>/dev/null | head -1 || true)
               if [ -n "$KSRC" ]; then
                 echo "=== patches-$PROBE_KV 全量 dry-run 预检（内核源码 $KSRC）==="
                 BAD=0
