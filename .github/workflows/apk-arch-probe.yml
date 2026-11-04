@@ -13,9 +13,9 @@ on:
         required: false
         default: https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb
       rootfs_url:
-        description: 取真实 apk 库用的 rootfs.squashfs（默认先用老仓库那一版，本仓库首次构建成功后可换成自己的）
+        description: 取真实 apk 库用的 rootfs.squashfs（默认本仓库自己 Release 里那份）
         required: false
-        default: https://github.com/likz0421/ponwrt-xg040gmd/releases/download/tyfza1-plus/rootfs.squashfs
+        default: https://github.com/likz0421/tyfza1-openwrt/releases/download/tyfza1/rootfs.squashfs
 
 permissions:
   contents: read
@@ -29,28 +29,13 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get -qq update -o Acquire::Retries=3
-          sudo apt-get install -y squashfs-tools curl
-          if command -v apk >/dev/null 2>&1; then
-            echo "APK=$(command -v apk)" >> "$GITHUB_ENV"
-          elif sudo apt-get install -y apk-tools >/dev/null 2>&1 && command -v apk >/dev/null 2>&1; then
-            echo "APK=$(command -v apk)" >> "$GITHUB_ENV"
-          elif command -v docker >/dev/null 2>&1; then
-            docker pull -q alpine:3.20
-            # 容器内外同路径挂载：--root 传的路径两边一致，不用改写参数
-            printf '%s\n' '#!/bin/bash' \
-              'exec docker run --rm -v "$RUNNER_TEMP:$RUNNER_TEMP" alpine:3.20 apk "$@"' \
-              > "$RUNNER_TEMP/apkw"
-            chmod +x "$RUNNER_TEMP/apkw"
-            echo "APK=$RUNNER_TEMP/apkw" >> "$GITHUB_ENV"
-            echo "用 Alpine 3.20 容器里的 apk-tools；若与 OpenWrt 那个 fork 语义有差，"
-            echo "以构建内那次探针为准（那条用的是构建树自己编出来的 apk）。"
-          else
-            echo "::error::拿不到 apk（没装成也没有 docker）—— 这条快探针做不了"
-            exit 1
-          fi
-          # APK 是写进 GITHUB_ENV 的，本步骤里还取不到（set -u 会直接炸），
-          # 版本打印放到真正用它的那一步。
-          echo "apk 来源已选定，下一步用"
+          sudo apt-get install -y squashfs-tools curl qemu-user-static
+          # 不再用宿主的 apk：ubuntu-24.04 的 apk-tools 与固件里那份（apk-tools 3.0.5）
+          # 不是同一代，前两次探针 "Unable to read database" 就是这么来的 ——
+          # 那是探针环境的问题，不是索引的结论。现在直接在解出来的真实 rootfs 里
+          # chroot 跑设备自己那份 apk，用 qemu-user 执行 aarch64 二进制。
+          ls -l /usr/bin/qemu-aarch64-static
+          echo "qemu 就绪，下一步在 chroot 里调用设备自己的 apk"
 
       - name: Take the real rootfs from the Release
         env:
@@ -73,49 +58,103 @@ jobs:
           echo "真实 apk 库：$(wc -c < "$RUNNER_TEMP/root/lib/apk/db/installed") 字节，装了多少包：$(grep -c '^P:' "$RUNNER_TEMP/root/lib/apk/db/installed" || true)"
           echo "镜像里 honk 的版本：$(awk '/^P:honk$/{f=1;next} f&&/^V:/{print substr($0,3); exit} f&&/^P:/{exit}' "$RUNNER_TEMP/root/lib/apk/db/installed")"
 
-      - name: Try the third-party index with the device's real arch list
+      - name: Try the candidate indexes with the device's own apk
         env:
-          INDEX: ${{ inputs.index_url }}
+          DAE_INDEX: ${{ inputs.index_url }}
+          OFF_PKGS: https://downloads.openwrt.org/releases/25.12.6/packages/aarch64_generic/packages/packages.adb
+          OFF_LUCI: https://downloads.openwrt.org/releases/25.12.6/packages/aarch64_generic/luci/packages.adb
         run: |
           set -euo pipefail
-          SB="$RUNNER_TEMP/sb"
-          mk_sandbox() {
-            local alias="$1"
-            rm -rf "$SB"
-            mkdir -p "$SB/etc/apk/keys" "$SB/lib/apk/db"
-            cp "$RUNNER_TEMP/root/lib/apk/db/installed" "$SB/lib/apk/db/installed"
-            [ -s "$RUNNER_TEMP/root/lib/apk/db/world" ] && cp "$RUNNER_TEMP/root/lib/apk/db/world" "$SB/lib/apk/db/world" || true
-            cp "$RUNNER_TEMP/root/etc/apk/arch" "$SB/etc/apk/arch"
-            cp "$RUNNER_TEMP/root"/etc/apk/keys/* "$SB/etc/apk/keys/" 2>/dev/null || true
-            curl -sL -o "$SB/etc/apk/keys/daeuniverse.pem" \
-              "https://raw.githubusercontent.com/daeuniverse/openwrt-packages/main/keys/public-key.pem"
-            [ -s "$SB/etc/apk/keys/daeuniverse.pem" ] || echo "::warning::公钥没取到，验签会失败"
-            [ -n "$alias" ] && printf '%s\n' "$alias" >> "$SB/etc/apk/arch"
-            printf '%s\n' "@daeuniverse $INDEX" > "$SB/etc/apk/repositories"
-            echo "-- /etc/apk/arch = $(tr '\n' ' ' < "$SB/etc/apk/arch")"
-          }
-          run_case() {
-            local tag="$1" q n
-            mk_sandbox "$2"
-            if ! "$APK" --root "$SB" update > "$RUNNER_TEMP/update-$tag.log" 2>&1; then
-              echo "   [$tag] apk update 失败："; tail -6 "$RUNNER_TEMP/update-$tag.log" || true
-              return 0
-            fi
-            q="$({ "$APK" --root "$SB" search -a honk 2>&1 || true; }; { "$APK" --root "$SB" info -a honk 2>&1 || true; })"
-            printf '%s\n' "$q" | grep -i honk | head -4
-            n="$(printf '%s' "$q" | grep -ci 'honk-' || true)"
-            echo "   [$tag] 候选数=$n"
-            eval "${tag}_HITS=$n"
-            return 0
-          }
-          A_HITS=0; B_HITS=0
-          run_case A ""
-          run_case B "aarch64_generic"
-          echo "VERDICT：设备原样命中 $A_HITS；加 aarch64_generic 别名后命中 $B_HITS"
-          if [ "${A_HITS:-0}" -gt 0 ]; then
-            echo "VERDICT: 官方/daeuniverse 的 generic 索引设备原样就能用 —— 设备源可以直接换成它，不需要自建仓库"
-          elif [ "${B_HITS:-0}" -gt 0 ]; then
-            echo "VERDICT: 需要把 aarch64_generic 追加进 /etc/apk/arch 才能用 —— 混装稳定版 userspace 的风险要先评估"
+          ROOT="$RUNNER_TEMP/root"
+          # 设备自己那份 apk（apk-tools 3.0.5，aarch64）+ qemu-user，语义和真机一致。
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOT/usr/bin/"
+          # chroot 里解析不了 127.0.0.53（宿主是 systemd-resolved 的话），直接写云上那两台。
+          if grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+            printf 'nameserver 168.63.129.16\nnameserver 8.8.8.8\n' | sudo tee "$ROOT/etc/resolv.conf" >/dev/null
           else
-            echo "VERDICT: 两条路都拿不到候选 —— 「用大家都能用的源」在 a55 上做不到，只能自产"
+            sudo cp -f /etc/resolv.conf "$ROOT/etc/resolv.conf"
+          fi
+          if [ ! -s "$ROOT/etc/ssl/certs/ca-certificates.crt" ]; then
+            sudo mkdir -p "$ROOT/etc/ssl/certs"
+            sudo cp -f /etc/ssl/certs/ca-certificates.crt "$ROOT/etc/ssl/certs/"
+            echo "镜像里没有 CA bundle，临时借宿主的（只为让 TLS 走通，不影响架构判定）"
+          fi
+          sudo mkdir -p "$ROOT/tmp"
+          APKBIN=$( { cd "$ROOT" && ls sbin/apk usr/bin/apk 2>/dev/null; } | head -1 )
+          [ -n "$APKBIN" ] || { echo "::error::rootfs 里没有 apk 二进制，探针做不了"; exit 1; }
+          echo "设备 apk：/$APKBIN"
+          devapk() { sudo chroot "$ROOT" /usr/bin/qemu-aarch64-static "/$APKBIN" "$@"; }
+
+          # 验签要的钥匙：daeuniverse 的 + OpenWrt 25.12 官方发布钥。
+          # 官方钥从官方 25.12.6 的 rootfs 打包里取（GitHub 上的 keyring 镜像停在 2025-08，
+          # 那份里没有 openwrt-25.12.pem，别拿它当真相）。
+          curl -sL -o "$ROOT/etc/apk/keys/daeuniverse.pem" \
+            "https://raw.githubusercontent.com/daeuniverse/openwrt-packages/main/keys/public-key.pem"
+          [ -s "$ROOT/etc/apk/keys/daeuniverse.pem" ] || echo "::warning::daeuniverse 公钥没取到"
+          curl -sL -o "$RUNNER_TEMP/official-rootfs.tar.gz" \
+            "https://downloads.openwrt.org/releases/25.12.6/targets/armsr/armv8/openwrt-25.12.6-armsr-armv8-rootfs.tar.gz"
+          if tar -tzf "$RUNNER_TEMP/official-rootfs.tar.gz" >/dev/null 2>&1; then
+            sudo tar -xzf "$RUNNER_TEMP/official-rootfs.tar.gz" -C "$ROOT" --no-same-owner \
+              --wildcards 'etc/apk/keys/*.pem' --keep-newer-files 2>/dev/null || true
+            echo "官方 rootfs 里的 apk 钥匙：$(ls "$ROOT"/etc/apk/keys/ | tr '\n' ' ')"
+            echo "官方 armv8 设备声明的架构：$(tar -xzO -f "$RUNNER_TEMP/official-rootfs.tar.gz" etc/apk/arch 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "::warning::官方 rootfs 打包没拿到，官方索引那一路会因缺钥匙而验签失败 —— 那是钥匙问题，不是架构问题"
+          fi
+          sudo chmod -R u+rw "$ROOT/etc/apk"
+
+          ORIG_ARCH="$RUNNER_TEMP/arch.orig"
+          sudo cp "$ROOT/etc/apk/arch" "$ORIG_ARCH"
+          DEV_ARCH=$(tr '\n' ',' < "$ORIG_ARCH" | sed 's/,$//')
+          echo "设备原样声明的架构：$DEV_ARCH"
+
+          setup_case() {
+            local tag="$1" alias="$2"
+            sudo cp "$ORIG_ARCH" "$ROOT/etc/apk/arch"
+            if [ -n "$alias" ]; then printf '%s\n' "$alias" | sudo tee -a "$ROOT/etc/apk/arch" >/dev/null; fi
+            printf '%s\n' \
+              "@daeuniverse $DAE_INDEX" \
+              "@openwrt-pkgs $OFF_PKGS" \
+              "@openwrt-luci $OFF_LUCI" > "$RUNNER_TEMP/repositories.list"
+            sudo cp "$RUNNER_TEMP/repositories.list" "$ROOT/etc/apk/repositories"
+            echo "-- 用例 $tag：/etc/apk/arch = $(sudo tr '\n' ' ' < "$ROOT/etc/apk/arch")"
+          }
+
+          # 三个探针包：honk 只在 daeuniverse 有；curl 在官方 packages；luci-app-ddns 在官方 luci。
+          # 三种问法都试（search / policy / add --simulate），任一给出带版本号的候选就算吃得到。
+          probe_pkg() {
+            local p="$1" out n
+            out="$( { devapk search -a -- "$p" 2>&1 || true; }; { devapk policy -- "$p" 2>&1 || true; }; { devapk add --simulate -- "$p" 2>&1 || true; } )"
+            n="$(printf '%s\n' "$out" | grep -c -- "${p}-[0-9]" || true)"
+            echo "     $(printf '%-14s' "$p") 候选=$n  $( { printf '%s\n' "$out" | grep -m1 -- "${p}-[0-9]"; } || { printf '%s\n' "$out" | grep -m1 -iE 'no such package|ERROR'; } || echo '(无输出)')"
+            HIT="$n"
+          }
+
+          A_TOT=0; B_TOT=0; A_OK=0; B_OK=0
+          for tag in A B; do
+            if [ "$tag" = A ]; then setup_case A ""; else setup_case B "aarch64_generic"; fi
+            log="$RUNNER_TEMP/update-$tag.log"
+            if devapk update > "$log" 2>&1; then
+              echo "   [$tag] apk update 跑通（$(wc -l < "$log") 行输出）"
+              if [ "$tag" = A ]; then A_OK=1; else B_OK=1; fi
+            else
+              echo "   [$tag] apk update 没跑通 —— 这是探针环境/钥匙的问题，不能当成索引或架构的结论："
+              tail -6 "$log" || true
+            fi
+            for p in honk curl luci-app-ddns; do
+              probe_pkg "$p"
+              if [ "$tag" = A ]; then A_TOT=$((A_TOT + HIT)); else B_TOT=$((B_TOT + HIT)); fi
+            done
+          done
+
+          echo "VERDICT：设备原样（$DEV_ARCH）命中 $A_TOT（update_ok=$A_OK）；追加 aarch64_generic 后命中 $B_TOT（update_ok=$B_OK）"
+          echo "（Honk 走 daeuniverse；官方 25.12.6 那两路是 packages=$OFF_PKGS 与 luci=$OFF_LUCI）"
+          if [ "${A_TOT:-0}" -gt 0 ] && [ "$A_OK" = 1 ]; then
+            echo "VERDICT: generic 索引设备原样就能吃 —— 设备源可以直接换成官方 + daeuniverse，不需要自建仓库"
+          elif [ "${B_TOT:-0}" -gt 0 ] && [ "$B_OK" = 1 ]; then
+            echo "VERDICT: 必须把 aarch64_generic 追加进 /etc/apk/arch 才吃得到 —— 源可以换成官方的，但固件要写那一行"
+          elif [ "$A_OK" != 1 ] && [ "$B_OK" != 1 ]; then
+            echo "VERDICT: 两组都没跑通 apk update —— 探针无法下结论，先修探针，别把它当成『a55 只能用自建源』"
+          else
+            echo "VERDICT: update 跑通但候选为 0 —— generic 索引对 a55 确实不可用"
           fi
