@@ -34,8 +34,18 @@ jobs:
             echo "APK=$(command -v apk)" >> "$GITHUB_ENV"
           elif sudo apt-get install -y apk-tools >/dev/null 2>&1 && command -v apk >/dev/null 2>&1; then
             echo "APK=$(command -v apk)" >> "$GITHUB_ENV"
+          elif command -v docker >/dev/null 2>&1; then
+            docker pull -q alpine:3.20
+            # 容器内外同路径挂载：--root 传的路径两边一致，不用改写参数
+            printf '%s\n' '#!/bin/bash' \
+              'exec docker run --rm -v "$RUNNER_TEMP:$RUNNER_TEMP" alpine:3.20 apk "$@"' \
+              > "$RUNNER_TEMP/apkw"
+            chmod +x "$RUNNER_TEMP/apkw"
+            echo "APK=$RUNNER_TEMP/apkw" >> "$GITHUB_ENV"
+            echo "用 Alpine 3.20 容器里的 apk-tools；若与 OpenWrt 那个 fork 语义有差，"
+            echo "以构建内那次探针为准（那条用的是构建树自己编出来的 apk）。"
           else
-            echo "::error::装不到 apk 可执行文件（Ubuntu 源里没有 apk-tools）—— 这条快探针做不了，改用构建内探针"
+            echo "::error::拿不到 apk（没装成也没有 docker）—— 这条快探针做不了"
             exit 1
           fi
           "$APK" --version

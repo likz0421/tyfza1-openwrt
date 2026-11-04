@@ -52,6 +52,14 @@ jobs:
             zlib1g-dev file wget curl device-tree-compiler u-boot-tools swig \
             libelf-dev python3-pyelftools python3-dev libfuse-dev pkgconf cmake ninja-build ccache
 
+      - name: Clone port repo at pinned SHA
+        run: |
+          set -euo pipefail
+          git clone -q "$TYFZA1_URL" "$TYFZA1_WORK"
+          git -C "$TYFZA1_WORK" fetch -q --depth 1 origin "$TYFZA1_SHA"
+          git -C "$TYFZA1_WORK" checkout -q FETCH_HEAD
+          test -f "$TYFZA1_WORK/port/scripts/build.sh"
+          echo "= $(git -C "$TYFZA1_WORK" rev-parse --short HEAD) 版本 $(cat "$TYFZA1_WORK/VERSION")"
       - name: OMCI compiler (rust pinned by their workflow)
         run: |
           set -euo pipefail
@@ -594,7 +602,6 @@ jobs:
       # 只出结论不红作业：结论没拿到之前，不往固件里塞一条可能 404 的源。
 
       - name: Probe whether a third-party aarch64_generic index is usable
-        run: |
         run: |
           set -euo pipefail
           T="$TYFZA1_WORK/sources/openwrt"
