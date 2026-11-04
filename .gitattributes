@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.pem -text
+*.der binary
+*.adb binary

@@ -1,0 +1,223 @@
+name: base-probe（25.12.6 能不能承载 TYFZA1 端口）
+
+# 目的单一：把"官方稳定版 v25.12.6 + LeoooChen 的 rtl9617c 端口"到底卡在哪一步
+# 跑成日志，不猜。三道门槛依次是：
+#   1) 端口自带的 openwrt 补丁在 25.12.6 上打不打得上（port-overlay.sh 逐条报）
+#   2) target/linux/rtl9617c 声明的 KERNEL_PATCHVER（端口是 6.18）在这棵树里
+#      有没有对应的内核版本文件（25.12 系只有 target/linux/generic/kernel-6.12）
+#   3) 过得了前两道，才谈得上 defconfig / 内核与驱动编译
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: 基座标签或分支（如 v25.12.6 / openwrt-25.12 / master）
+        required: false
+        default: v25.12.6
+      kernel_patchver:
+        description: 强制把端口的 KERNEL_PATCHVER 改成这个值（留空=用端口声明的 6.18）
+        required: false
+        default: ''
+      do_defconfig:
+        description: 跑 make defconfig 并验 WiFi 驱动能否被选中
+        type: boolean
+        default: true
+      do_kernel_build:
+        description: 继续编内核与驱动（耗时长，只有前两道过了才建议开）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  WORK: ${{ github.workspace }}/work
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: ctrl
+
+      - name: Load pins
+        env:
+          IN_REF: ${{ inputs.openwrt_ref }}
+          IN_KV: ${{ inputs.kernel_patchver }}
+        run: |
+          set -euo pipefail
+          # 输入只在这里进 shell（经 env 映射，不往脚本文本里插值），并当场校验
+          case "$IN_REF" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::openwrt_ref 不合法：[$IN_REF]"; exit 1;;
+          esac
+          case "$IN_KV" in
+            *[!0-9.]*|*[!A-Za-z0-9.]*) echo "::error::kernel_patchver 只允许数字和点：[$IN_KV]"; exit 1;;
+          esac
+          set -a; . "$GITHUB_WORKSPACE/ctrl/pins.env"; set +a
+          for v in OPENWRT_URL PORT_URL PORT_SHA THEME_SHA HONK_SHA256 DAEUNIV_SHA; do
+            [ -n "${!v:-}" ] || { echo "::error::pins.env 缺 $v"; exit 1; }
+          done
+          {
+            echo "OPENWRT_URL=$OPENWRT_URL"
+            echo "PORT_URL=$PORT_URL"
+            echo "PORT_SHA=$PORT_SHA"
+            echo "PORT_KERNEL_PATCHVER=$PORT_KERNEL_PATCHVER"
+            echo "PROBE_REF=$IN_REF"
+            echo "PROBE_KV=$IN_KV"
+          } >> "$GITHUB_ENV"
+          echo "基座=$IN_REF 端口=$PORT_SHA 端口声明内核=$PORT_KERNEL_PATCHVER 内核覆盖=${IN_KV:-（不覆盖）}"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -hT /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -qq update -o Acquire::Retries=3
+          sudo apt-get install -y build-essential busybox clang-18 llvm-18 lld-18 flex bison gawk \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip \
+            zlib1g-dev file wget curl device-tree-compiler u-boot-tools swig \
+            libelf-dev python3-pyelftools python3-dev libfuse-dev pkgconf cmake ninja-build ccache
+
+      - name: Fetch base OpenWrt at the requested ref
+        env:
+          IN_REF: ${{ inputs.openwrt_ref }}
+        run: |
+          set -euo pipefail
+          REF="$IN_REF"
+          case "$REF" in
+            *[!A-Za-z0-9._-]*|'') echo "::error::openwrt_ref 不合法：[$REF]（只允许字母数字 . _ -）"; exit 1;;
+          esac
+          mkdir -p "$WORK"
+          git init -q "$WORK/sources/openwrt"
+          git -C "$WORK/sources/openwrt" remote add origin "$OPENWRT_URL"
+          case "$REF" in
+            v*) git -C "$WORK/sources/openwrt" fetch -q --depth 1 origin "refs/tags/$REF" ;;
+            *)  git -C "$WORK/sources/openwrt" fetch -q --depth 1 origin "$REF" ;;
+          esac
+          git -C "$WORK/sources/openwrt" -c advice.detachedHead=false checkout -q FETCH_HEAD
+          echo "基座 HEAD $(git -C "$WORK/sources/openwrt" rev-parse --short HEAD) $(git -C "$WORK/sources/openwrt" show -s --format=%cI HEAD)"
+          echo "通用内核细节文件：$(ls "$WORK/sources/openwrt/target/linux/generic" | grep '^kernel-' | tr '\n' ' ')"
+          echo "airoha 在不在（XG 那条线关心）：$(ls "$WORK/sources/openwrt/target/linux" | grep -c '^airoha$') 个目录匹配"
+
+      - name: Clone port repo at pinned SHA
+        run: |
+          set -euo pipefail
+          git clone -q "$PORT_URL" "$WORK/port"
+          git -C "$WORK/port" fetch -q --depth 1 origin "$PORT_SHA"
+          git -C "$WORK/port" checkout -q FETCH_HEAD
+          test -f "$WORK/port/port/scripts/sync-overlay.sh"
+          echo "端口 $(git -C "$WORK/port" rev-parse --short HEAD) 版本 $(cat "$WORK/port/VERSION")"
+
+      - name: Apply port overlay onto this base
+        # port-overlay.sh 用 exit 2 表达"补丁打不上"，这是结论不是崩溃：
+        # 捕获它、继续把后面的门槛跑完，最后一并给 VERDICT。
+        env:
+          TYFZA1_VERSION_REPO: https://downloads.openwrt.org/releases/25.12.6
+        run: |
+          set -uo pipefail
+          chmod +x "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh"
+          bash "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh" \
+            "$WORK/sources/openwrt" "$WORK/port" > "$WORK/overlay.log" 2>&1
+          rc=$?
+          cat "$WORK/overlay.log"
+          if [ "$rc" = 2 ]; then
+            echo "OVERLAY_VERDICT=补丁打不上（详见上面逐条）"
+            echo "::error::端口在 $PROBE_REF 上有补丁打不上"
+            exit 2
+          elif [ "$rc" != 0 ]; then
+            echo "::error::port-overlay.sh 异常退出 $rc"; exit "$rc"
+          fi
+          echo "OVERLAY_VERDICT=全部落位"
+
+      - name: Point the target at the requested kernel series
+        run: |
+          set -euo pipefail
+          KV="$PROBE_KV"
+          MK="$WORK/sources/openwrt/target/linux/rtl9617c/Makefile"
+          [ -s "$MK" ] || { echo "::error::没有 $MK（overlay 没铺成？）"; exit 1; }
+          echo "改前：$(grep -E '^KERNEL_PATCHVER' "$MK" || true)"
+          if [ -n "$KV" ]; then
+            sed -i "s/^KERNEL_PATCHVER:=.*/KERNEL_PATCHVER:=$KV/" "$MK"
+            echo "已强制为 $KV（只动工作树，不改上游仓库）"
+          fi
+          echo "改后：$(grep -E '^KERNEL_PATCHVER' "$MK")"
+          WANT=$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' "$MK" | head -1)
+          if [ -f "$WORK/sources/openwrt/target/linux/generic/kernel-$WANT" ]; then
+            echo "内核系列 $WANT 在这棵树里有版本文件 ✔"
+            grep -E 'LINUX_VERSION-|SOURCE' "$WORK/sources/openwrt/target/linux/generic/kernel-$WANT" \
+              | sed 's/^/    /' | head -4 || true
+          else
+            echo "::error::基座没有 target/linux/generic/kernel-$WANT —— 这棵树不支持内核 $WANT（端口需要 $PORT_KERNEL_PATCHVER）"
+            exit 3
+          fi
+
+      - name: defconfig and check the Wi-Fi driver becomes selectable
+        if: inputs.do_defconfig == true
+        run: |
+          set -euo pipefail
+          cd "$WORK/sources/openwrt"
+          # 扫描缓存整份作废：KernelPackage 在 target/linux/*/modules.mk，由
+          # package/kernel/linux/Makefile 扫进 .packageinfo；每目录各自的 dump
+          # 缓存 tmp/info/.packageinfo-* 不删就等于没作废（上一轮就是这么丢 WiFi 的）。
+          rm -rf tmp/info tmp/.packageinfo tmp/.targetinfo \
+                 tmp/.config-package.in tmp/.config-target.in
+          make -s prepare-tmpinfo V=s > "$WORK/tmpinfo.log" 2>&1 || \
+            { echo "::error::prepare-tmpinfo 失败"; tail -30 "$WORK/tmpinfo.log"; exit 1; }
+          echo "kmod-rtl-ax-ap：.packageinfo=$( { grep -c '^Package: kmod-rtl-ax-ap$' tmp/.packageinfo || true; } ) 处  kconfig=$( { grep -c 'config PACKAGE_kmod-rtl-ax-ap' tmp/.config-package.in || true; } ) 处"
+          make defconfig </dev/null > "$WORK/defconfig.log" 2>&1 || {
+            echo "::error::make defconfig 失败"; tail -40 "$WORK/defconfig.log"; exit 1; }
+          grep -iE 'warn|unmet|depend|error' "$WORK/defconfig.log" | head -15 || true
+          MISS=""
+          for p in kmod-rtl-ax-ap wpad-mbedtls wifi-scripts iw wireless-regdb; do
+            grep -qx "CONFIG_PACKAGE_$p=y" .config || MISS="$MISS $p"
+          done
+          [ -z "$MISS" ] || { echo "::error::defconfig 后仍没选中 WiFi 组件:$MISS"; exit 1; }
+          echo "✅ WiFi 五项在 $PROBE_REF 上都能选中"
+
+      - name: Build kernel and the rtl_ax_ap driver
+        if: inputs.do_kernel_build == true
+        run: |
+          set -euo pipefail
+          cd "$WORK/sources/openwrt"
+          make tools/install -j"$(nproc)" > "$WORK/tools.log" 2>&1 || {
+            echo "::error::tools/install 失败"; tail -30 "$WORK/tools.log"; exit 1; }
+          make toolchain/install -j"$(nproc)" > "$WORK/tc.log" 2>&1 || {
+            echo "::error::toolchain/install 失败"; tail -30 "$WORK/tc.log"; exit 1; }
+          for i in 1 2 3; do
+            if make target/compile -j"$(nproc)" > "$WORK/kernel-$i.log" 2>&1; then
+              echo "✅ 内核与驱动在 $PROBE_REF 上编过了（第 $i 次尝试）"
+              break
+            fi
+            echo "第 $i 次失败，抓 (NEW) 提问与真错误："
+            { cat "$WORK/kernel-$i.log"; find logs -type f -exec cat {} + 2>/dev/null | tail -c 300000; } \
+              | grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' | sed -E 's/\) \[.*//; s/^\(//' \
+              | sort -u | head -20 || true
+            grep -nE 'error:|Error [0-9]|\*\*\*|undefined reference|No rule' "$WORK/kernel-$i.log" | head -12 || true
+            if [ "$i" = 3 ]; then echo "::error::内核编不过，见 kernel-3.log"; exit 1; fi
+          done
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-probe-${{ inputs.openwrt_ref }}
+          path: ${{ env.WORK }}/*.log
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always()
+        run: |
+          {
+            echo "## 基座探针结论"
+            echo "- 基座：`$PROBE_REF`｜内核覆盖：`${PROBE_KV:-（用端口声明）}`"
+            echo "- 端口：\`$PORT_SHA\`（声明 KERNEL_PATCHVER=$PORT_KERNEL_PATCHVER）"
+            echo "- overlay/补丁：见 overlay.log 最后一行 VERDICT"
+            echo "- 作业结论：$JOB_STATUS"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          JOB_STATUS: ${{ job.status }}
