@@ -25,6 +25,10 @@ on:
         description: 继续编内核与驱动（耗时长，只有前两道过了才建议开）
         type: boolean
         default: false
+      skip_unapplicable_patches:
+        description: 打不上的 openwrt 补丁记为跳过并继续（只为问"驱动/内核能不能过"，产出的 config 不可刷）
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -118,6 +122,7 @@ jobs:
         # 捕获它、继续把后面的门槛跑完，最后一并给 VERDICT。
         env:
           TYFZA1_VERSION_REPO: https://downloads.openwrt.org/releases/25.12.6
+          SKIP_UNAPPLICABLE: ${{ inputs.skip_unapplicable_patches && '1' || '0' }}
         run: |
           set -uo pipefail
           chmod +x "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh"

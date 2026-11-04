@@ -14,7 +14,19 @@ TREE="${1:?用法: port-overlay.sh <openwrt树> <端口仓库> [config]}"
 PORT="${2:?缺少端口仓库路径}"
 CFG="${3:-}"
 [ -d "$TREE/.git" ] || { echo "::error::$TREE 不是 git 工作树"; exit 1; }
-[ -d "$PORT/port" ] || { echo "::error::$PORT 里没有 port/（端口仓库结构变了？）"; exit 1; }
+# 端口仓库的结构是 <repo>/port/{overlay,packages,host-patches,openwrt-patches,configs}。
+# 传仓库根还是传 port/ 都认，但两处都找不到就直接死——上一轮就是传错了一层，
+# 结果 overlay 一步没铺、glob 空转还报"补丁失败 0 个"，等于给了个假结论。
+if [ ! -d "$PORT/overlay/target/linux" ] && [ -d "$PORT/port/overlay/target/linux" ]; then
+  PORT="$PORT/port"
+fi
+[ -d "$PORT/overlay/target/linux" ] || {
+  echo "::error::在 $PORT 里找不到 overlay/target/linux —— 端口仓库结构变了？"; exit 1; }
+for d in packages host-patches openwrt-patches configs; do
+  [ -d "$PORT/$d" ] || { echo "::error::端口缺 $PORT/$d"; exit 1; }
+done
+shopt -s nullglob
+echo "端口目录：$PORT（$(git -C "$PORT/.." rev-parse --short HEAD 2>/dev/null || echo '?')）"
 T=$(cd "$TREE" && pwd)
 FAIL=0
 
@@ -26,12 +38,14 @@ if [ -d "$T/target/linux/realtek" ]; then
 fi
 
 echo "== 1) target overlay（照 sync-overlay 的目录逐个 rsync）=="
-for d in "$PORT"/overlay/target/linux/*/; do
+ovl=("$PORT"/overlay/target/linux/*/)
+[ "${#ovl[@]}" -gt 0 ] || { echo "::error::$PORT/overlay/target/linux 下没有任何目标目录"; exit 1; }
+for d in "${ovl[@]}"; do
   [ -d "$d" ] || continue
   name=$(basename "$d")
   mkdir -p "$T/target/linux/$name"
   rsync -a --delete "$d" "$T/target/linux/$name/"
-  echo "  target/linux/$name ← overlay（KERNEL_PATCHVER=$(sed -n 's/^KERNEL_PATCHVER:=\(.*/\1/p' "$T/target/linux/$name/Makefile" 2>/dev/null | head -1)）"
+  echo "  target/linux/$name ← overlay（KERNEL_PATCHVER=$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' "$T/target/linux/$name/Makefile" 2>/dev/null | head -1)）"
 done
 
 echo "== 2) 端口自带的包 =="
@@ -41,13 +55,17 @@ for p in luci-app-tyfza1-pon tyfza1-pon-control tyfza1-storage; do
     rsync -a --delete "$PORT/packages/$p/" "$T/package/$p/"
     echo "  package/$p 已铺"
   else
-    echo "  · package/$p 端口里没有，跳过"
+    FAIL=$((FAIL + 1))
+    echo "  ::error::端口里没有 packages/$p（预期结构对不上，不能当没事发生）"
   fi
 done
 
-echo "== 3) host-patches 落到各包的 patches/（包目录不存在就记一条，不硬来）=="
+echo "== 3) host-patches 落到各包的 patches/ =="
 map_host_patch() {   # <patch 文件> <包目录>
   local f="$1" dest="$2"
+  if [ ! -f "$f" ]; then
+    FAIL=$((FAIL + 1)); echo "  ::error::端口补丁文件不存在：$f"; return
+  fi
   if [ -d "$dest" ]; then
     mkdir -p "$dest/patches"
     cp -f "$f" "$dest/patches/" && echo "  $(basename "$f") → ${dest#"$T"/}/patches/"
@@ -67,22 +85,29 @@ map_host_patch "$HP/132-rpcd-scan-pause.patch"                "$T/package/system
 map_host_patch "$HP/110-wireless-regdb-signed.patch"          "$T/package/firmware/wireless-regdb"
 
 echo "== 4) openwrt-patches 逐个试（这是兼容性的真答案，一个都不许含糊）=="
-for c in "$PORT"/openwrt-patches/*.patch; do
-  [ -e "$c" ] || continue
+pls=("$PORT"/openwrt-patches/*.patch)
+[ "${#pls[@]}" -gt 0 ] || {
+  echo "::error::$PORT/openwrt-patches 里一个补丁都没有 —— glob 空转不等于全部通过"; exit 1; }
+n_ok=0; n_skip=0; n_ign=0
+for c in "${pls[@]}"; do
   b=$(basename "$c")
   if git -C "$T" apply --reverse --check "$c" 2>/dev/null; then
-    echo "  已应用过（跳过）：$b"
-    continue
+    echo "  已应用过（跳过）：$b"; n_skip=$((n_skip + 1)); continue
   fi
   if err=$(git -C "$T" apply --check "$c" 2>&1); then
-    git -C "$T" apply "$c" && echo "  可应用 ✔：$b"
+    git -C "$T" apply "$c" && { echo "  可应用 ✔：$b"; n_ok=$((n_ok + 1)); }
   else
-    FAIL=$((FAIL + 1))
-    echo "  打不上 ✘：$b"
-    printf '%s\n' "$err" | sed 's/^/      /' | head -6
+    printf '%s\n' "$err" | sed 's/^/      /' | head -8
+    if [ "${SKIP_UNAPPLICABLE:-0}" = "1" ]; then
+      echo "  跳过（SKIP_UNAPPLICABLE=1，可行性试验用，产出物不可刷）：$b"
+      n_ign=$((n_ign + 1))
+    else
+      FAIL=$((FAIL + 1))
+      echo "  打不上 ✘：$b"
+    fi
   fi
 done
-echo "  小结：补丁失败 $FAIL 个"
+echo "  小结：试了 ${#pls[@]} 个（可应用 $n_ok，本来已在 $n_skip，跳过 $n_ign，失败 $FAIL）"
 
 echo "== 5) luci 补丁（feed 装好之后再跑，这里只探测）=="
 if [ -d "$T/feeds/luci/modules/luci-mod-status" ] && [ -x "$PORT/scripts/apply-luci-patches.sh" ]; then
