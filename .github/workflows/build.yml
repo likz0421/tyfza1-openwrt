@@ -630,7 +630,10 @@ jobs:
           fi
           PROBE="$TYFZA1_WORK/probe-root"
           rm -rf "$PROBE"
-          cp -a "$ROOT" "$PROBE"
+          # 整份 rootfs 里有 /dev/* 设备节点，普通用户 cp -a 会失败（需要 CAP_MKNOD），
+          # 所以 sudo 复制再把属主还给 runner，后面那些不带 sudo 的写入才成立。
+          sudo cp -a "$ROOT" "$PROBE"
+          sudo chown -R "$(id -u):$(id -g)" "$PROBE"
           sudo cp /usr/bin/qemu-aarch64-static "$PROBE/usr/bin/"
           if grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
             printf 'nameserver 168.63.129.16\nnameserver 8.8.8.8\n' > "$PROBE/etc/resolv.conf"
@@ -639,7 +642,11 @@ jobs:
           fi
           [ -s "$PROBE/etc/ssl/certs/ca-certificates.crt" ] || {
             mkdir -p "$PROBE/etc/ssl/certs"; cp -f /etc/ssl/certs/ca-certificates.crt "$PROBE/etc/ssl/certs/"; }
-          APKBIN=$( { cd "$PROBE" && ls sbin/apk usr/bin/apk 2>/dev/null; } | head -1 || true )
+          # 不用 `ls a b`：一个路径不存在时 ls 退 2，pipefail 会让整步无声死掉（快探针上一轮就这样）。
+          APKBIN=""
+          for c in sbin/apk usr/bin/apk bin/apk; do
+            if [ -f "$PROBE/$c" ]; then APKBIN="$c"; break; fi
+          done
           if [ -z "${APKBIN:-}" ]; then
             echo "::error::复制出来的 rootfs 里没有 apk 二进制，探针做不了（不下结论）"; exit 0
           fi
@@ -740,6 +747,11 @@ jobs:
           fail_on_unmatched_files: false
 
       - name: Publish latest.json pointer into the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 这一步的 cwd 是构建产物目录，不是 git 工作树：不给 GH_REPO 的话
+          # gh 会报 "no git remote"，上传直接失败。
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           cd "$TYFZA1_WORK/artifacts/release"
@@ -761,9 +773,19 @@ jobs:
             wifi_driver=kmod-rtl-ax-ap \
             upstream_sha="$TYFZA1_SHA" \
             notes="判断新旧只看 sha256 与 built_at_local；滚动 tag 不改 published_at"
-          # 指针本身也当资产传上去：URL 随 tag 固定，人和脚本都只问一个地址
+          # 指针本身也当资产传上去：URL 随 tag 固定，人和脚本都只问一个地址。
+          # 上一版这一步只 cp 到工作区、没真上传（步骤名却写着 Publish）——
+          # 所以这次传完立刻读回 API 验，传不上去就红，不留"名字骗人"的空间。
           cp "$TYFZA1_WORK/pointer/latest.json" ./latest.json
-          echo "✅ latest.json 就位：$(wc -c < latest.json) 字节，sha256 $(sha256sum latest.json | cut -c1-12)…"
+          gh release upload tyfza1 latest.json --clobber
+          sleep 3
+          got=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/tyfza1" \
+                | grep -o '"name": *"latest.json"' | head -1 || true)
+          [ -n "$got" ] || { echo "::error::latest.json 没成为 Release 资产（步骤名与实际不符）"; exit 1; }
+          url=$(curl -sL -o /dev/null -w '%{http_code}' \
+                  "https://github.com/$GITHUB_REPOSITORY/releases/download/tyfza1/latest.json")
+          echo "✅ latest.json 已在 Release：$(wc -c < latest.json) 字节指针，下载探测 HTTP $url"
 
 
       - name: Verify the release text carries this build

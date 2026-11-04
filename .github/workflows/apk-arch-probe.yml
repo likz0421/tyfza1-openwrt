@@ -80,8 +80,16 @@ jobs:
             echo "镜像里没有 CA bundle，临时借宿主的（只为让 TLS 走通，不影响架构判定）"
           fi
           sudo mkdir -p "$ROOT/tmp"
-          APKBIN=$( { cd "$ROOT" && ls sbin/apk usr/bin/apk 2>/dev/null; } | head -1 )
-          [ -n "$APKBIN" ] || { echo "::error::rootfs 里没有 apk 二进制，探针做不了"; exit 1; }
+          # squashfs 里通常没有 /dev/null（init 时由内核建的），chroot 里的 apk 要写它就报错。
+          sudo mkdir -p "$ROOT/dev"
+          if [ ! -e "$ROOT/dev/null" ]; then sudo mknod "$ROOT/dev/null" c 1 3; sudo chmod 666 "$ROOT/dev/null"; fi
+          # 别用 `ls a b`：其中一个不存在时 ls 退出码是 2，配上 pipefail + 2>/dev/null
+          # 就是"整步 30ms 内无声死掉"（上一轮就是这么挂的，日志里一个字都没有）。
+          APKBIN=""
+          for c in sbin/apk usr/bin/apk bin/apk; do
+            if [ -f "$ROOT/$c" ]; then APKBIN="$c"; break; fi
+          done
+          [ -n "$APKBIN" ] || { echo "::error::rootfs 里没有 apk 二进制，探针做不了"; find "$ROOT" -maxdepth 3 -name 'apk*' 2>/dev/null | head -10 || true; exit 1; }
           echo "设备 apk：/$APKBIN"
           devapk() { sudo chroot "$ROOT" /usr/bin/qemu-aarch64-static "/$APKBIN" "$@"; }
 
