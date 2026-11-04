@@ -159,6 +159,31 @@ jobs:
           if [ -n "$KV" ]; then
             sed -i "s/^KERNEL_PATCHVER:=.*/KERNEL_PATCHVER:=$KV/" "$MK"
             echo "已强制为 $KV（只动工作树，不改上游仓库）"
+            # 端口只带 config/files/patches-6.18。强行改用 6.12 后构建系统会去找
+            # *-6.12，三者全缺 ⇒ 内核 .config 只剩 generic 种子，syncconfig 停在
+            # 交互式提问 "Page size choice[1-3?]: ARM64_4K_PAGES (NEW)" 直接 Error 1。
+            # 这是探针环境不完整，不是"内核编不过"的结论，先把种子补齐再谈编译。
+            TDIR="$WORK/sources/openwrt/target/linux/rtl9617c"
+            SRC_KV="${PORT_KERNEL_PATCHVER:-6.18}"
+            if [ "$KV" != "$SRC_KV" ]; then
+              echo "== 内核系列 $SRC_KV → $KV：按新系列复刻端口的 target 内核文件（试验性回移）=="
+              for kind in config files patches; do
+                src="$TDIR/$kind-$SRC_KV"; dst="$TDIR/$kind-$KV"
+                if [ -e "$dst" ]; then
+                  echo "  $kind-$KV 已存在，沿用"
+                elif [ -e "$src" ]; then
+                  cp -a "$src" "$dst"
+                  echo "  $kind-$SRC_KV → $kind-$KV（补丁/驱动 API 未必兼容，后续真错误照实报）"
+                else
+                  echo "  ::warning::端口没有 $kind-$SRC_KV，$kind-$KV 缺失"
+                fi
+              done
+              CFG="$TDIR/config-$KV"
+              if [ -f "$CFG" ] && ! grep -qE '^CONFIG_ARM64_(4K|16K|64K)_PAGES=y' "$CFG"; then
+                printf '\n# kernel %s：页大小 choice 不给答案会让 syncconfig 在非交互 CI 挂掉\nCONFIG_ARM64_4K_PAGES=y\n' "$KV" >> "$CFG"
+                echo "  已补 CONFIG_ARM64_4K_PAGES=y 到 config-$KV（4KB 是 arm64 默认）"
+              fi
+            fi
           fi
           echo "改后：$(grep -E '^KERNEL_PATCHVER' "$MK")"
           WANT=$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' "$MK" | head -1)
