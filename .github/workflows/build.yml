@@ -595,63 +595,63 @@ jobs:
 
       - name: Probe whether a third-party aarch64_generic index is usable
         run: |
+        run: |
           set -euo pipefail
           T="$TYFZA1_WORK/sources/openwrt"
-          ARCH=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' "$T/.config")
-          ROOT=$(find "$T/build_dir" -maxdepth 3 -type d -name 'root-rtl9617c*' 2>/dev/null | head -1 || true)
-          DECL=""
-          { [ -n "${ROOT:-}" ] && [ -f "$ROOT/etc/apk/arch" ] && DECL=$(tr -d '\r' < "$ROOT/etc/apk/arch" | tr '\n' ' '); } || true
-          echo "设备架构声明：${DECL:-（镜像里没有 /etc/apk/arch，说明 apk 用编译期架构 $ARCH）}"
+          DEV_ARCH=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' "$T/.config")
+          ROOT=$(find "$T/build_dir" -maxdepth 3 -type d -name 'root-rtl9617c' 2>/dev/null | head -1 || true)
+          # 沙箱必须用真实 rootfs 里的合法 apk 数据库：我上一版手搓了空的
+          # installed/world，apk 报 "Unable to read database" 是沙箱不完整，
+          # 我却把它当成"架构不兼容"的结论 —— 双重假结论，这里从根上改掉。
+          if [ -z "${ROOT:-}" ] || [ ! -s "$ROOT/lib/apk/db/installed" ]; then
+            echo "::error::找不到真实 rootfs 或其 apk 库（ROOT=${ROOT:-空}），探针无法进行"; exit 1
+          fi
+          echo "沙箱数据源：$ROOT/lib/apk/db/installed（$(wc -c < "$ROOT/lib/apk/db/installed") 字节）"
+          echo "设备声明的架构：$(tr '\n' ' ' < "$ROOT/etc/apk/arch")"
           for a in aarch64_cortex-a55 aarch64_generic; do
             printf '  %-22s %s\n' "$a" \
               "$(curl -s -o /dev/null -w '%{http_code}' -L "https://openwrt.daeuniverse.org/25.12/packages/$a/packages.adb")"
           done
           APK="$T/staging_dir/host/bin/apk"
-          if [ ! -x "$APK" ]; then
-            echo "::notice::构建树里没有 host apk（$APK），本轮只拿到索引可达性，兼容性结论留到下次"
-            exit 0
-          fi
-          echo "用 host apk 实跑：$APK ($("$APK" --version 2>&1 | head -1))"
-          DEV_ARCH=$(sed -n 's/^CONFIG_TARGET_ARCH_PACKAGES="\(.*\)"$/\1/p' "$T/.config")
-          # 两组对照：甲=设备真实的单架构；乙=额外追加 aarch64_generic 别名。
-          # 上一版我把别名直接写进探针根目录，等于自己把答案喂给自己 —— 那是假绿。
+          if [ ! -x "$APK" ]; then echo "::notice::没有 host apk（$APK），兼容性结论留到下次"; exit 0; fi
+          echo "host apk：$("$APK" --version 2>&1 | head -1)"
+          A_HITS=0; B_HITS=0
           probe_case() {
-            local name="$1" archlist="$2" sb hit
+            local name="$1" alias="$2" sb q n
             sb="$TYFZA1_WORK/probe-$name"
             rm -rf "$sb"
-            mkdir -p "$sb/etc/apk/keys" "$sb/lib/apk/db" "$sb/var/lib/apk"
-            printf '%s\n' $archlist > "$sb/etc/apk/arch"
-            # apk v3 要有可读的 db 文件才会跑 update（上一版没建 db，报的
-            # "Unable to read database" 是我自己搭的假根不完整，不是索引不兼容）
-            : > "$sb/lib/apk/db/installed"
-            : > "$sb/lib/apk/db/world"
+            mkdir -p "$sb/etc/apk/keys" "$sb/lib/apk/db"
+            cp "$ROOT/lib/apk/db/installed" "$sb/lib/apk/db/installed"
+            [ -s "$ROOT/lib/apk/db/world" ] && cp "$ROOT/lib/apk/db/world" "$sb/lib/apk/db/world" || true
+            cp "$ROOT/etc/apk/arch" "$sb/etc/apk/arch"
+            cp "$ROOT"/etc/apk/keys/* "$sb/etc/apk/keys/" 2>/dev/null || true
             cp "$GITHUB_WORKSPACE/files/etc/apk/keys/daeuniverse.pem" "$sb/etc/apk/keys/" 2>/dev/null || true
+            [ -s "$ROOT/etc/os-release" ] && cp "$ROOT/etc/os-release" "$sb/etc/os-release" || true
+            [ -n "$alias" ] && printf '%s\n' "$alias" >> "$sb/etc/apk/arch"
             printf '%s\n' "@daeuniverse https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb" \
               > "$sb/etc/apk/repositories"
             echo "-- 用例 $name：/etc/apk/arch = $(tr '\n' ' ' < "$sb/etc/apk/arch")"
-            if "$APK" --root "$sb" update > "$TYFZA1_WORK/probe-$name.log" 2>&1; then
-              echo "   apk update 通过；索引里的 honk："
-              { "$APK" --root "$sb" search -a honk 2>&1 || true; } | head -6
-              hit=$({ "$APK" --root "$sb" search -a honk 2>/dev/null | grep -c honk || true; })
-              echo "   候选数=$hit"
-            else
-              echo "   apk update 失败："
-              tail -8 "$TYFZA1_WORK/probe-$name.log" || true
-              hit=0
+            if ! "$APK" --root "$sb" update > "$TYFZA1_WORK/probe-$name.log" 2>&1; then
+              echo "   apk update 没跑通 —— 这是探针环境的问题，不能当成索引的结论："
+              tail -6 "$TYFZA1_WORK/probe-$name.log" || true
+              return 0
             fi
-            [ "$name" = A ] && PROBE_A_HITS=$hit || PROBE_B_HITS=$hit
+            q="$({ "$APK" --root "$sb" search -a honk 2>&1 || true; }; { "$APK" --root "$sb" info -a honk 2>&1 || true; })"
+            printf '%s\n' "$q" | grep -i 'honk' | head -4
+            n="$(printf '%s' "$q" | grep -ci 'honk-' || true)"
+            echo "   候选数=$n"
+            if [ "$name" = A ]; then A_HITS="$n"; else B_HITS="$n"; fi
             return 0
           }
-          PROBE_A_HITS=0; PROBE_B_HITS=0
-          probe_case A "$DEV_ARCH"
-          probe_case B "$DEV_ARCH aarch64_generic"
-          echo "VERDICT：设备原样($DEV_ARCH) 命中 $PROBE_A_HITS 个候选；加 generic 别名后命中 $PROBE_B_HITS 个"
-          if [ "${PROBE_A_HITS:-0}" -gt 0 ]; then
-            echo "VERDICT: 可以直接把 daeuniverse 的 aarch64_generic 索引写成设备源"
-          elif [ "${PROBE_B_HITS:-0}" -gt 0 ]; then
-            echo "VERDICT: 只有把 aarch64_generic 写进 /etc/apk/arch 才吃得到 generic 索引（要评估误装风险，暂不写入）"
+          probe_case A ""
+          probe_case B "aarch64_generic"
+          echo "VERDICT：设备原样 $DEV_ARCH 命中 ${A_HITS:-0} 个候选；追加 aarch64_generic 别名后命中 ${B_HITS:-0} 个"
+          if [ "${A_HITS:-0}" -gt 0 ]; then
+            echo "VERDICT: daeuniverse 的 generic 索引设备原样就能吃 —— 可以写成设备源"
+          elif [ "${B_HITS:-0}" -gt 0 ]; then
+            echo "VERDICT: 要把 aarch64_generic 写进 /etc/apk/arch 才吃得到 —— 混装风险要先评估"
           else
-            echo "VERDICT: generic 索引这条路走不通 —— TYFZA1 的在线更新只能走本次构建自产的仓库"
+            echo "VERDICT: 两组都 0 候选（且 update 跑通了才算数）—— generic 这条路对 a55 不通"
           fi
 
       - name: Package release artifacts
