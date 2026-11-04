@@ -204,7 +204,17 @@ jobs:
               | grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' | sed -E 's/\) \[.*//; s/^\(//' \
               | sort -u | head -20 || true
             grep -nE 'error:|Error [0-9]|\*\*\*|undefined reference|No rule' "$WORK/kernel-$i.log" | head -12 || true
-            if [ "$i" = 3 ]; then echo "::error::内核编不过，见 kernel-3.log"; exit 1; fi
+            if [ "$i" = 3 ]; then
+              # 并行不带 V=s 时真正的编译错误被收进 logs/，stdout 只剩
+              # "ERROR: target/linux failed to build" 这一行 —— 上一轮就是这样
+              # 拿不到原因的。单跑一次把真错误逼到 stdout。
+              echo "=== 就地 -j1 V=s 重跑，拿真实编译错误 ==="
+              make target/compile -j1 V=s > "$WORK/kernel-verbose.log" 2>&1 || true
+              grep -nE 'error:|Error [0-9]|\*\*\*|No rule to make target|No such file' \
+                "$WORK/kernel-verbose.log" | tail -25 || true
+              tail -40 "$WORK/kernel-verbose.log" || true
+              echo "::error::内核编不过，详见 kernel-verbose.log"; exit 1
+            fi
           done
 
       - name: Upload probe logs
