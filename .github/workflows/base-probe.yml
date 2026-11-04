@@ -126,6 +126,15 @@ jobs:
         run: |
           set -uo pipefail
           chmod +x "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh"
+          # 上游 openwrt-patches 是按 master 写的，在 v25.12.6 上上下文对不上。
+          # 按该 tag 的真实文件重做过两份补丁，这里交给 port-overlay.sh 逐条真 apply。
+          if [ "${PROBE_REF:-}" = v25.12.6 ]; then
+            export PORT_PATCH_DIR="$GITHUB_WORKSPACE/ctrl/patches/v25.12.6"
+            for p in 100-wifi-ucode-txpower.patch 160-mtd-utils-host-zstd.patch; do
+              [ -s "$PORT_PATCH_DIR/$p" ] || { echo "::error::缺 25.12.6 重基线补丁 $p"; exit 1; }
+            done
+            echo "使用 25.12.6 重基线补丁：$PORT_PATCH_DIR"
+          fi
           # runner 用 `bash -e {0}` 执行 run 块：任何非 0 都会当场中止，`rc=$?` 那行
           # 根本活不到（上一轮三个探针就是这么把日志吞掉的）。必须用 && / || 形态取状态码。
           bash "$GITHUB_WORKSPACE/ctrl/scripts/port-overlay.sh" \

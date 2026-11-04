@@ -9,6 +9,8 @@
 #
 # 用法：port-overlay.sh <openwrt树> <端口仓库> [config 文件]
 #   环境变量 TYFZA1_VERSION_REPO 可覆盖上游写死的 CONFIG_VERSION_REPO。
+#   环境变量 PORT_PATCH_DIR 指向按该基座重做过上下文的补丁目录（如 patches/v25.12.6）：
+#   上游 openwrt-patches 是按 master 写的，落到稳定版上上下文对不上时会逐个试这里的同名补丁。
 set -uo pipefail
 TREE="${1:?用法: port-overlay.sh <openwrt树> <端口仓库> [config]}"
 PORT="${2:?缺少端口仓库路径}"
@@ -98,7 +100,21 @@ for c in "${pls[@]}"; do
     git -C "$T" apply "$c" && { echo "  可应用 ✔：$b"; n_ok=$((n_ok + 1)); }
   else
     printf '%s\n' "$err" | sed 's/^/      /' | head -8
-    if [ "${SKIP_UNAPPLICABLE:-0}" = "1" ]; then
+    # 上游补丁按 master 写；落到 v25.12.6 稳定版时上下文偏移（例如 mac80211.sh 的
+    # system() 调用在 25.12 没有 >/dev/null 2>&1、tools/mtd-utils 行号差 2 行）。
+    # 同名重基线补丁放在 PORT_PATCH_DIR 里，逐条真 apply，不靠 --3way 猜合并。
+    ALT=""
+    if [ -n "${PORT_PATCH_DIR:-}" ] && [ -s "$PORT_PATCH_DIR/$b" ]; then
+      if git -C "$T" apply --check "$PORT_PATCH_DIR/$b" 2>/dev/null; then
+        ALT="$PORT_PATCH_DIR/$b"
+      else
+        echo "      （$PORT_PATCH_DIR/$b 也打不上，按原补丁报错）"
+      fi
+    fi
+    if [ -n "$ALT" ]; then
+      git -C "$T" apply "$ALT" && {
+        echo "  用稳定版重基线补丁 ✔：$b（上游原版针对 master）"; n_ok=$((n_ok + 1)); }
+    elif [ "${SKIP_UNAPPLICABLE:-0}" = "1" ]; then
       echo "  跳过（SKIP_UNAPPLICABLE=1，可行性试验用，产出物不可刷）：$b"
       n_ign=$((n_ign + 1))
     else
@@ -128,7 +144,9 @@ fi
 VERSION=$(cat "$PORT/../VERSION" 2>/dev/null || echo probe)
 sed -i '/^CONFIG_VERSIONOPT=/d; /^# CONFIG_VERSIONOPT is not set$/d; /^CONFIG_VERSION_NUMBER=/d; /^CONFIG_VERSION_REPO=/d; /^CONFIG_SIGNED_PACKAGES=/d; /^# CONFIG_SIGNED_PACKAGES is not set$/d; /^CONFIG_SIGN_EACH_PACKAGE=/d; /^# CONFIG_SIGN_EACH_PACKAGE is not set$/d' "$T/.config"
 printf 'CONFIG_VERSIONOPT=y\nCONFIG_VERSION_NUMBER="%s"\n' "$VERSION" >> "$T/.config"
-REPO="${TYFZA1_VERSION_REPO:-https://downloads.openwrt.org/snapshots}"
+# 上游 sync-overlay.sh:55 写死官方 snapshots，那是滚动快照：库版本/内核 vermagic
+# 天天变，与稳定版基线不对齐。默认改成 25.12.6 稳定版发布源，别再留快照兜底。
+REPO="${TYFZA1_VERSION_REPO:-https://downloads.openwrt.org/releases/25.12.6}"
 printf 'CONFIG_VERSION_REPO="%s"\nCONFIG_SIGNED_PACKAGES=y\nCONFIG_SIGN_EACH_PACKAGE=y\n' "$REPO" >> "$T/.config"
 echo "  CONFIG_VERSION_REPO=$REPO（上游原值是官方 snapshots）"
 if [ -s "$PORT/configs/tyfza1-compat.config" ]; then

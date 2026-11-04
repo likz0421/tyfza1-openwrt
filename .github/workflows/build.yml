@@ -136,6 +136,14 @@ jobs:
           # .config 就落回基线默认机型，答的自然是别人的内核配置。
           # 这里提前调同一条命令；它是幂等的（rsync --delete + 先 sed 删再 printf 追加），
           # 后面 build.sh 再执行一遍不会叠加。
+          # 修上游 bug：sync-overlay.sh:55 把 CONFIG_VERSION_REPO 写死成官方 snapshots。
+          # 用户要求稳定版 25.12.6、不要快照 —— 跑它之前就地改这一行（只改本次 clone 的副本，
+          # 不 fork、不改上游仓库）。build.sh 第 25 行再调同一脚本时拿到的已是稳定版。
+          SOV=port/scripts/sync-overlay.sh
+          grep -q 'downloads.openwrt.org/snapshots' "$SOV" || {
+            echo "::error::上游 sync-overlay.sh 里找不到 snapshots 硬编码（上游改了？需重新核对）"; exit 1; }
+          sed -i 's|https://downloads.openwrt.org/snapshots|https://downloads.openwrt.org/releases/25.12.6|g' "$SOV"
+          echo "已修上游源：$(grep -n 'CONFIG_VERSION_REPO' "$SOV")"
           sh port/scripts/sync-overlay.sh sources/openwrt > sync-overlay.log 2>&1 || {
             echo "::error::上游 sync-overlay 失败"; tail -30 sync-overlay.log; exit 1; }
           [ -d sources/openwrt/target/linux/rtl9617c ] \
@@ -304,6 +312,13 @@ jobs:
           grep -q '^CONFIG_TARGET_rtl9617c_generic=y' .config \
             || { echo "::error::.config 里没启用 rtl9617c/generic 子目标"; exit 1; }
           echo "✅ defconfig 后 BTF 仍在、机型为 rtl9617c（.config $(grep -c '^CONFIG_' .config) 条）"
+          # 稳定版硬门槛：上游 sync-overlay.sh 写死的 snapshots 已被就地修掉，这里验收
+          VR=$(sed -n 's/^CONFIG_VERSION_REPO="\(.*\)"$/\1/p' .config)
+          [ "$VR" = "https://downloads.openwrt.org/releases/25.12.6" ] || {
+            echo "::error::CONFIG_VERSION_REPO 不是 25.12.6 稳定版：[$VR]"; exit 1; }
+          ! grep -qsE '^[^#]*snapshots' .config || {
+            echo "::error::.config 里还有生效的 snapshots 引用"; grep -n snapshots .config | head; exit 1; }
+          echo "✅ 稳定版源已锁定：$VR（无 snapshots）"
           make tools/install -j"$(nproc)" > "$TYFZA1_WORK/oldconfig-tools.log" 2>&1 || {
             echo "::error::tools/install 失败"; tail -40 "$TYFZA1_WORK/oldconfig-tools.log"; exit 1; }
           # 还必须有 toolchain：内核 scripts/Kconfig.include:40 会真的去跑 $(CC) 探选项，
@@ -548,6 +563,17 @@ jobs:
           BIN=""
           for r in $ROOTS; do [ -s "$r/usr/bin/honk-core" ] && { BIN="$r/usr/bin/honk-core"; break; }; done
           echo "✅ honk-core 在镜像里：$BIN ($(du -h "$BIN" | cut -f1))"
+          # honk 面板必须能在 LuCI 里点开：只验「包进了 apk 库」不够，
+          # 之前踩过服务在、菜单不在的情况，所以按实体文件再判一次。
+          LUCI_OK=""
+          for r in $ROOTS; do
+            for f in "$r"/usr/share/luci/menu.d/*honk* "$r"/www/luci-static/resources/view/honk/*; do
+              [ -s "$f" ] && { LUCI_OK="$f"; break 2; }
+            done
+          done
+          [ -n "$LUCI_OK" ] || {
+            echo "::error::镜像里没有 luci-app-honk 的面板文件（服务编进去了，LuCI 里却看不到）"; exit 1; }
+          echo "✅ honk LuCI 面板在镜像里：$LUCI_OK"
           # 二进制版本必须是 manifest 里钉的那个：上一轮用户投诉"大鹅不是最新的"，
           # 根因就是 manifest 落后（0.1.0-beta.4 而 feed main 已到 beta.5）。
           HV=""
