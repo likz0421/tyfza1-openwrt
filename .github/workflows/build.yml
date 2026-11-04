@@ -620,32 +620,51 @@ jobs:
               "$(curl -s -o /dev/null -w '%{http_code}' -L "https://openwrt.daeuniverse.org/25.12/packages/$a/packages.adb")"
           done
           APK="$T/staging_dir/host/bin/apk"
-          if [ ! -x "$APK" ]; then echo "::notice::没有 host apk（$APK），兼容性结论留到下次"; exit 0; fi
-          echo "host apk：$("$APK" --version 2>&1 | head -1)"
+          # 不用 host 那份 apk，也不用宿主的：OpenWrt 25.12 的 apk 是 apk-tools 3.0.5，
+          # 它的 --root / db 路径语义和 runner 上那代不一样，前两次 "Unable to read database"
+          # 都被我误当成"架构不通"的结论。现在照着真机来：把装配好的 rootfs 复制一份，
+          # 用 qemu-user 在 chroot 里跑它**自带的** apk —— 二进制、库、钥匙、db 全是设备那套。
+          if [ ! -x /usr/bin/qemu-aarch64-static ]; then
+            sudo apt-get -qq update -o Acquire::Retries=3
+            sudo apt-get install -y qemu-user-static
+          fi
+          PROBE="$TYFZA1_WORK/probe-root"
+          rm -rf "$PROBE"
+          cp -a "$ROOT" "$PROBE"
+          sudo cp /usr/bin/qemu-aarch64-static "$PROBE/usr/bin/"
+          if grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+            printf 'nameserver 168.63.129.16\nnameserver 8.8.8.8\n' > "$PROBE/etc/resolv.conf"
+          else
+            cp -f /etc/resolv.conf "$PROBE/etc/resolv.conf"
+          fi
+          [ -s "$PROBE/etc/ssl/certs/ca-certificates.crt" ] || {
+            mkdir -p "$PROBE/etc/ssl/certs"; cp -f /etc/ssl/certs/ca-certificates.crt "$PROBE/etc/ssl/certs/"; }
+          APKBIN=$( { cd "$PROBE" && ls sbin/apk usr/bin/apk 2>/dev/null; } | head -1 || true )
+          if [ -z "${APKBIN:-}" ]; then
+            echo "::error::复制出来的 rootfs 里没有 apk 二进制，探针做不了（不下结论）"; exit 0
+          fi
+          echo "设备 apk：/$APKBIN（host apk 那份只是参考：$([ -x "$APK" ] && "$APK" --version 2>&1 | head -1 || echo 无)）"
+          devapk() { sudo chroot "$PROBE" /usr/bin/qemu-aarch64-static "/$APKBIN" "$@"; }
+          cp "$GITHUB_WORKSPACE/files/etc/apk/keys/daeuniverse.pem" "$PROBE/etc/apk/keys/" 2>/dev/null || \
+            echo "::warning::daeuniverse 公钥没进钥匙目录，验签会失败（那是钥匙问题，不是架构问题）"
+          printf '%s\n' "@daeuniverse https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb" \
+            > "$PROBE/etc/apk/repositories"
+          cp "$PROBE/etc/apk/arch" "$TYFZA1_WORK/arch.orig"
           A_HITS=0; B_HITS=0
           probe_case() {
-            local name="$1" alias="$2" sb q n
-            sb="$TYFZA1_WORK/probe-$name"
-            rm -rf "$sb"
-            mkdir -p "$sb/etc/apk/keys" "$sb/lib/apk/db"
-            cp "$ROOT/lib/apk/db/installed" "$sb/lib/apk/db/installed"
-            [ -s "$ROOT/lib/apk/db/world" ] && cp "$ROOT/lib/apk/db/world" "$sb/lib/apk/db/world" || true
-            cp "$ROOT/etc/apk/arch" "$sb/etc/apk/arch"
-            cp "$ROOT"/etc/apk/keys/* "$sb/etc/apk/keys/" 2>/dev/null || true
-            cp "$GITHUB_WORKSPACE/files/etc/apk/keys/daeuniverse.pem" "$sb/etc/apk/keys/" 2>/dev/null || true
-            [ -s "$ROOT/etc/os-release" ] && cp "$ROOT/etc/os-release" "$sb/etc/os-release" || true
-            [ -n "$alias" ] && printf '%s\n' "$alias" >> "$sb/etc/apk/arch"
-            printf '%s\n' "@daeuniverse https://openwrt.daeuniverse.org/25.12/packages/aarch64_generic/packages.adb" \
-              > "$sb/etc/apk/repositories"
-            echo "-- 用例 $name：/etc/apk/arch = $(tr '\n' ' ' < "$sb/etc/apk/arch")"
-            if ! "$APK" --root "$sb" update > "$TYFZA1_WORK/probe-$name.log" 2>&1; then
+            local name="$1" alias="$2" q n
+            cp "$TYFZA1_WORK/arch.orig" "$PROBE/etc/apk/arch"
+            if [ -n "$alias" ]; then printf '%s\n' "$alias" >> "$PROBE/etc/apk/arch"; fi
+            echo "-- 用例 $name：/etc/apk/arch = $(tr '\n' ' ' < "$PROBE/etc/apk/arch")"
+            if ! devapk update > "$TYFZA1_WORK/probe-$name.log" 2>&1; then
               echo "   apk update 没跑通 —— 这是探针环境的问题，不能当成索引的结论："
               tail -6 "$TYFZA1_WORK/probe-$name.log" || true
               return 0
             fi
-            q="$({ "$APK" --root "$sb" search -a honk 2>&1 || true; }; { "$APK" --root "$sb" info -a honk 2>&1 || true; })"
-            printf '%s\n' "$q" | grep -i 'honk' | head -4
-            n="$(printf '%s' "$q" | grep -ci 'honk-' || true)"
+            echo "   update 输出：$(head -3 "$TYFZA1_WORK/probe-$name.log" | tr '\n' ' ')"
+            q="$({ devapk search -a honk 2>&1 || true; }; { devapk policy honk 2>&1 || true; }; { devapk add --simulate honk 2>&1 || true; })"
+            printf '%s\n' "$q" | grep -i 'honk' | head -6
+            n="$(printf '%s\n' "$q" | grep -c 'honk-[0-9]' || true)"
             echo "   候选数=$n"
             if [ "$name" = A ]; then A_HITS="$n"; else B_HITS="$n"; fi
             return 0
