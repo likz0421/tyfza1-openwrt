@@ -1,0 +1,56 @@
+Subject: [PATCH] pci: dwc: Export dw_pcie_msi_host_init()
+
+The RTL9617C PCIe glue (drivers/pci/controller/dwc/pcie-rtl9617c.c) is
+built as its own translation unit and drives the DesignWare MSI setup
+through the dw_pcie_host_ops.msi_init hook, which calls
+dw_pcie_msi_host_init().  Upstream v6.18 exports that helper, but on
+6.12 it is still static in pcie-designware-host.c, so the glue would
+not compile with an implicit declaration.
+
+Backport the v6.18 shape: make the helper non-static, export it with
+EXPORT_SYMBOL_GPL and declare it in pcie-designware.h, including the
+matching static inline stub for the !CONFIG_PCIE_DW_HOST case.
+
+Signed-off-by: likz0421 <likz0421@users.noreply.github.com>
+---
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -317,7 +317,7 @@
+ 	return 0;
+ }
+ 
+-static int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
++int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
+ {
+ 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	struct device *dev = pci->dev;
+@@ -391,6 +391,7 @@
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(dw_pcie_msi_host_init);
+ 
+ static void dw_pcie_host_request_msg_tlp_res(struct dw_pcie_rp *pp)
+ {
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -681,6 +681,7 @@
+ 
+ #ifdef CONFIG_PCIE_DW_HOST
+ irqreturn_t dw_handle_msi_irq(struct dw_pcie_rp *pp);
++int dw_pcie_msi_host_init(struct dw_pcie_rp *pp);
+ int dw_pcie_setup_rc(struct dw_pcie_rp *pp);
+ int dw_pcie_host_init(struct dw_pcie_rp *pp);
+ void dw_pcie_host_deinit(struct dw_pcie_rp *pp);
+@@ -691,6 +692,11 @@
+ static inline irqreturn_t dw_handle_msi_irq(struct dw_pcie_rp *pp)
+ {
+ 	return IRQ_NONE;
++}
++
++static inline int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
++{
++	return -ENODEV;
+ }
+ 
+ static inline int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
