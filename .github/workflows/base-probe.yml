@@ -172,9 +172,9 @@ jobs:
             SRC_KV="${PORT_KERNEL_PATCHVER:-6.18}"
             if [ "$KV" != "$SRC_KV" ]; then
               echo "== 内核系列 $SRC_KV → $KV：按新系列复刻端口的 target 内核文件（试验性回移）=="
-              # config / files 先朴素复刻：config 是 defconfig 种子（未知符号会被 syncconfig
-              # 丢弃，不致命）；files 是 6.18 新驱动源码（API 不兼容 6.12，编译期才会暴露，
-              # 这正是「6.12 能不能直接承载 6.18 端口」要拿到的真证据，不在此处假绿）。
+              # config / files 先朴素复刻作为兜底（保证即便本仓库没有对应产物也能跑），
+              # 随后由下面三段用本仓库的重基线产物覆盖：patches（已验证 0 失败）、
+              # files（驱动适配工作区）、config（重排后的内核配置种子）。
               for kind in config files; do
                 src="$TDIR/$kind-$SRC_KV"; dst="$TDIR/$kind-$KV"
                 if [ -e "$dst" ]; then
@@ -199,6 +199,22 @@ jobs:
                 if [ ! -e "$TDIR/patches-$KV" ] && [ -e "$TDIR/patches-$SRC_KV" ]; then
                   cp -a "$TDIR/patches-$SRC_KV" "$TDIR/patches-$KV"
                 fi
+              fi
+              # files：优先用本仓库的 files-6.12（6.18 新驱动的 6.12 适配工作区）。
+              # 目前内容与端口 files-6.18 相同——驱动 API 不兼容 6.12 这件事留给内核
+              # 编译期如实暴露，不在这里做「假装编得过」的裁剪。
+              CTRL_F12="$GITHUB_WORKSPACE/ctrl/patches/rtl9617c-6.12/files-$KV"
+              if [ -d "$CTRL_F12" ]; then
+                rm -rf "$TDIR/files-$KV"
+                cp -a "$CTRL_F12" "$TDIR/files-$KV"
+                echo "  用本仓库的 files-$KV 覆盖（共 $(find "$TDIR/files-$KV" -type f | wc -l) 个文件）"
+              fi
+              # config：优先用本仓库重排好的 config-6.12（剔掉 6.18 独有的自动符号、
+              # 补齐 ARM64_4K_PAGES），而不是直接沿用 6.18 那份 dump。
+              CTRL_C12="$GITHUB_WORKSPACE/ctrl/patches/rtl9617c-6.12/config-$KV"
+              if [ -f "$CTRL_C12" ]; then
+                cp -f "$CTRL_C12" "$TDIR/config-$KV"
+                echo "  用本仓库重排的 config-$KV 覆盖（$(grep -cE '^CONFIG_' "$TDIR/config-$KV") 条）"
               fi
               CFG="$TDIR/config-$KV"
               if [ -f "$CFG" ] && ! grep -qE '^CONFIG_ARM64_(4K|16K|64K)_PAGES=y' "$CFG"; then
