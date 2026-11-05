@@ -271,33 +271,64 @@ jobs:
             echo "::error::tools/install 失败"; tail -30 "$WORK/tools.log"; exit 1; }
           make toolchain/install -j"$(nproc)" > "$WORK/tc.log" 2>&1 || {
             echo "::error::toolchain/install 失败"; tail -30 "$WORK/tc.log"; exit 1; }
-          # 端口给的 config-6.12 是片段，arm64 架构级符号不全（上一轮缺
-          # RODATA_FULL_DEFAULT_ENABLED）。内核 syncconfig 碰到 (NEW) 符号会去读 stdin，
-          # 非交互 CI 里这一步直接判失败，于是永远看不到驱动的真错误。这里用 OpenWrt
-          # 自带的 target/linux/oldconfig：让 kconfig 按默认值补全，并把差额回写进
-          # target/linux/rtl9617c/config-6.12（老规则会过滤掉自动推导符号）。
-          # 另外 oldconfig 模式不静音依赖告警，能顺便看到 unmet direct dependencies
-          # ——syncconfig 模式把它们藏掉了。
-          # yes 被 SIGPIPE 打死是 141，pipefail 会把 make 的成功盖成失败，这里只对它关掉。
+          # 端口给的 config-6.12 只是片段，arm64 架构级符号不全（上一轮缺的就是
+          # RODATA_FULL_DEFAULT_ENABLED）。内核 syncconfig 碰到 (NEW) 符号会去读
+          # stdin，非交互 CI 里直接判失败，于是永远看不到驱动的真错误。补全走两级：
+          # ①正规路 OpenWrt 的 target/linux/oldconfig，配 CONFIG_TARGET=env 让差额写进
+          #   env/kernel-config —— 它是 LINUX_KCONFIG_LIST 的最高优先级层，不会把我们
+          #   的 config-6.12 片段涂成一团。上一轮这条规则挂了，所以上 -j1 V=s 抓原因。
+          # ②兜底：第一遍编译若死在 kconfig 提问上，就拿 OpenWrt 已经灌进 build_dir 的
+          #   .config，用内核自己的 olddefconfig（该模式不提问、不读 stdin）按默认值补齐，
+          #   差额同样塞进 env/kernel-config，再编第二遍。
+          # oldconfig 还有个附带价值：它不像 syncconfig 那样 conf_set_message_callback(NULL)，
+          # 能看到被静音掉的 unmet direct dependencies。
+          KV="${PROBE_KV:-$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' target/linux/rtl9617c/Makefile | head -1)}"
           set +o pipefail
-          yes "" | make target/linux/oldconfig > "$WORK/oldconfig.log" 2>&1 || {
-            echo "::error::target/linux/oldconfig 失败"; tail -40 "$WORK/oldconfig.log"; exit 1; }
+          yes "" | make target/linux/oldconfig CONFIG_TARGET=env -j1 V=s > "$WORK/oldconfig.log" 2>&1 \
+            || echo "::warning::target/linux/oldconfig 没跑成，稍后用内核 olddefconfig 兜底"
           set -o pipefail
           echo "=== oldconfig 判定为 NEW 的符号 ==="
           grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' "$WORK/oldconfig.log" \
             | sed -E 's/\) \[.*//; s/^\(//' | sort -u | head -40 || true
           echo "=== 依赖不满足（syncconfig 模式看不到，这里补上）==="
-          grep -A6 -iE "unmet (direct )?dependencies|WARNING: unmet" "$WORK/oldconfig.log" \
-            | head -60 || true
-          CFG12="target/linux/rtl9617c/config-${PROBE_KV:-$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' target/linux/rtl9617c/Makefile | head -1)}"
-          echo "=== 回写后的 $CFG12：$(grep -cE '^CONFIG_' "$CFG12" || true) 条 ==="
-          grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' "$CFG12" || true
-          cp "$CFG12" "$WORK/config-completed.log"
-          # -k 让内核构建在第一个失败后继续跑，一次把所有出错目录都摊出来——
-          # 不带 -k 时 make 停在第一个失败处，每 40 分钟只能暴露一处驱动错误。
-          # 有了 -k，重试三次不会有任何新信息，所以只跑一轮。
+          grep -A6 -iE "unmet (direct )?dependencies|WARNING: unmet" "$WORK/oldconfig.log" | head -60 || true
+          echo "=== oldconfig 自己的失败原因（-j1 V=s 全文在 oldconfig.log）==="
+          grep -nE 'error:|Error [0-9]+$|\*\*\*|No such file|No rule to make target|Permission denied' \
+            "$WORK/oldconfig.log" | head -30 || true
+          if [ -s env/kernel-config ]; then
+            echo "=== env/kernel-config 补了 $(grep -cE '^CONFIG_' env/kernel-config || true) 条 ==="
+            cp env/kernel-config "$WORK/env-kernel-config.log"
+          fi
+          # -k 让内核构建在第一个失败后继续，一次把所有出错目录都摊出来——
+          # 不带 -k 时 make 停在第一个失败处，每 40 分钟只暴露一处驱动断点。
+          ksrc() { find build_dir -maxdepth 7 -type d \
+            -path "*/target-*/linux-rtl9617c_generic/linux-$KV.*" 2>/dev/null | head -1 || true; }
           ATTEMPT_LOG="$WORK/kernel-1.log"
+          OKC=0
           if make -k target/compile -j"$(nproc)" </dev/null > "$ATTEMPT_LOG" 2>&1; then
+            OKC=1
+          else
+            KSRC=$(ksrc)
+            if [ -n "$KSRC" ] && [ -f "$KSRC/.config" ] \
+               && grep -qE '\(NEW\)|auto\.conf\.cmd: No such file' "$ATTEMPT_LOG"; then
+              echo "=== 第一遍卡在 kconfig 提问：olddefconfig 补齐后重编 ==="
+              cp "$KSRC/.config" "$WORK/config-before"
+              if make -C "$KSRC" ARCH=arm64 olddefconfig </dev/null > "$WORK/olddefconfig.log" 2>&1; then
+                mkdir -p env
+                grep -vxF -f "$WORK/config-before" "$KSRC/.config" > "$WORK/env-kernel-config" || true
+                echo "  补进 env/kernel-config 共 $(grep -cE '^CONFIG_' "$WORK/env-kernel-config" || true) 条"
+                grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' "$WORK/env-kernel-config" || true
+                cat "$WORK/env-kernel-config" > env/kernel-config
+                cp env/kernel-config "$WORK/env-kernel-config.log"
+                ATTEMPT_LOG="$WORK/kernel-2.log"
+                make -k target/compile -j"$(nproc)" </dev/null > "$ATTEMPT_LOG" 2>&1 && OKC=1
+              else
+                echo "::warning::olddefconfig 兜底也失败，原因见 olddefconfig.log"
+                grep -nE 'error:|Error [0-9]+$|\*\*\*|No such file' "$WORK/olddefconfig.log" | head -20 || true
+              fi
+            fi
+          fi
+          if [ "$OKC" = 1 ]; then
             echo "✅ 内核与驱动在 $PROBE_REF 上编过了"
           else
             # 并行不带 V=s 时真正的编译错误被收进 logs/，stdout 只剩
