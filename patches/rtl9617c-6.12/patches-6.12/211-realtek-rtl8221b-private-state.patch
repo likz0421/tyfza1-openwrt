@@ -1,0 +1,10 @@
+--- a/drivers/net/phy/realtek/realtek_main.c	2026-11-05 07:52:21.685247000 +0800
++++ b/drivers/net/phy/realtek/realtek_main.c	2026-11-05 07:52:21.688247700 +0800
+@@ -2223,6 +2223,7 @@
+ 	}, {
+ 		PHY_ID_MATCH_EXACT(0x001cc848),
+ 		.name           = "RTL8226B-CG_RTL8221B-CG 2.5Gbps PHY",
++		.probe		= rtl822x_probe,
+ 		.soft_reset     = genphy_soft_reset,
+ 		.get_features   = rtl822x_get_features,
+ 		.config_aneg    = rtl822x_config_aneg,

@@ -1,0 +1,22 @@
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -1,4 +1,11 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++
++config GPIO_RTL9617C
++	tristate "RTL9617C native GPIO controller"
++	depends on ARCH_RTL9617C && OF_GPIO && PINCTRL_RTL9617C
++	help
++	  Native GPIO data and direction control for the Taurus five-bank block.
++
+ #
+ # GPIO infrastructure and drivers
+ #
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_GPIO_RTL9617C) += gpio-rtl9617c.o
+ # generic gpio support: platform drivers, dedicated expander chips, etc
+ 
+ ccflags-$(CONFIG_DEBUG_GPIO)	+= -DDEBUG

@@ -1,0 +1,23 @@
+--- a/drivers/net/mdio/Kconfig
++++ b/drivers/net/mdio/Kconfig
+@@ -1,4 +1,12 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++config MDIO_RTL9617C
++	tristate "RTL9617C peripheral MDIO and copper PHY OCP"
++	depends on OF && PHYLIB && ARCH_RTL9617C
++	select OF_MDIO
++	help
++	  Native Taurus C22/C45 bus access and internal PHY register mapping.
++	  Does not initialize PHY calibration, the network engine or PON.
++
+ #
+ # MDIO Layer Configuration
+ #
+--- a/drivers/net/mdio/Makefile
++++ b/drivers/net/mdio/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_MDIO_RTL9617C) += mdio-rtl9617c.o
+ # Makefile for Linux MDIO bus drivers
+ 
+ obj-$(CONFIG_ACPI_MDIO)		+= acpi_mdio.o

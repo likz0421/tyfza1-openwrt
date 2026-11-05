@@ -1,0 +1,12 @@
+--- a/net/netfilter/nf_flow_table_core.c	2026-11-05 07:52:22.160852400 +0800
++++ b/net/netfilter/nf_flow_table_core.c	2026-11-05 07:52:22.162848900 +0800
+@@ -423,6 +423,9 @@
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
++	if (test_bit_acquire(NF_FLOW_HW_PENDING, &flow->flags))
++		return;
++
+ 	if (nf_flow_has_expired(flow) ||
+ 	    nf_ct_is_dying(flow->ct) ||
+ 	    nf_flow_custom_gc(flow_table, flow))

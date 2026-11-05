@@ -172,26 +172,44 @@ jobs:
             SRC_KV="${PORT_KERNEL_PATCHVER:-6.18}"
             if [ "$KV" != "$SRC_KV" ]; then
               echo "== 内核系列 $SRC_KV → $KV：按新系列复刻端口的 target 内核文件（试验性回移）=="
-              for kind in config files patches; do
+              # config / files 先朴素复刻：config 是 defconfig 种子（未知符号会被 syncconfig
+              # 丢弃，不致命）；files 是 6.18 新驱动源码（API 不兼容 6.12，编译期才会暴露，
+              # 这正是「6.12 能不能直接承载 6.18 端口」要拿到的真证据，不在此处假绿）。
+              for kind in config files; do
                 src="$TDIR/$kind-$SRC_KV"; dst="$TDIR/$kind-$KV"
                 if [ -e "$dst" ]; then
                   echo "  $kind-$KV 已存在，沿用"
                 elif [ -e "$src" ]; then
                   cp -a "$src" "$dst"
-                  echo "  $kind-$SRC_KV → $kind-$KV（补丁/驱动 API 未必兼容，后续真错误照实报）"
+                  echo "  $kind-$SRC_KV → $kind-$KV（驱动 API 未必兼容 6.12，后续真错误照实报）"
                 else
                   echo "  ::warning::端口没有 $kind-$SRC_KV，$kind-$KV 缺失"
                 fi
               done
+              # patches：优先用本仓库已按 6.12 内核源码重基线、并在干净 post-generic 6.12.112
+              # 树上 0 失败全量验证过的版本（patches/rtl9617c-6.12/patches-6.12），而不是把
+              # 6.18 补丁直接改名成 6.12（那会在 CI 上报 10+ 个 INCOMPAT，是之前探针假红的根因）。
+              CTRL_P12="$GITHUB_WORKSPACE/ctrl/patches/rtl9617c-6.12/patches-6.12"
+              if [ -d "$CTRL_P12" ]; then
+                rm -rf "$TDIR/patches-$KV"
+                cp -a "$CTRL_P12" "$TDIR/patches-$KV"
+                echo "  用本仓库重基线的 patches-$KV 覆盖（共 $(ls "$TDIR/patches-$KV"/*.patch 2>/dev/null | wc -l) 个，已验证 0 失败）"
+              else
+                echo "  ::warning::ctrl 里没有重基线的 patches-$KV，退回朴素改名（可能 INCOMPAT）"
+                if [ ! -e "$TDIR/patches-$KV" ] && [ -e "$TDIR/patches-$SRC_KV" ]; then
+                  cp -a "$TDIR/patches-$SRC_KV" "$TDIR/patches-$KV"
+                fi
+              fi
               CFG="$TDIR/config-$KV"
               if [ -f "$CFG" ] && ! grep -qE '^CONFIG_ARM64_(4K|16K|64K)_PAGES=y' "$CFG"; then
                 printf '\n# kernel %s：页大小 choice 不给答案会让 syncconfig 在非交互 CI 挂掉\nCONFIG_ARM64_4K_PAGES=y\n' "$KV" >> "$CFG"
                 echo "  已补 CONFIG_ARM64_4K_PAGES=y 到 config-$KV（4KB 是 arm64 默认）"
               fi
-              # 不做「隔离打不上的补丁再继续编」：实测 6.12 上有 10 个补丁不兼容
-              # （211 与 213 先后挡住，全量 dry-run 又列出 150/190/202/207/210/216/217/218）。
-              # 逐个隔离只会让内核越编越缺 PON/flowtable/WiFi 功能，还把「编过了」
-              # 变成假答案。整份补丁保持原样，由 step11 的全量预检一次列清并给结论。
+              # 补丁层已按 6.12 全量重基线（0 失败），整份保持原样交给内核编译期。
+              # 真正的迁移门槛在 files 层：files-6.12 是朴素复刻的 6.18 新驱动源码
+              # （约 120 个文件，含 rtl_ax_ap/pci.c 等），API 面向 6.18 内核，落到 6.12
+              # 上会编不过——这正是要拿到的真证据。不为「编过」而删驱动，那样只会把
+              # 「编过了」变成假答案。编译失败的真错误照实报给 step11 收尾。
             fi
           fi
           echo "改后：$(grep -E '^KERNEL_PATCHVER' "$MK")"
