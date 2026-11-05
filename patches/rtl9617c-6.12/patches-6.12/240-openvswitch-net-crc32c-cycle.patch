@@ -1,0 +1,25 @@
+--- a/net/Kconfig	2026-11-05 11:01:06.005474000 +0800
++++ b/net/Kconfig	2026-11-05 11:01:06.005474000 +0800
+@@ -78,6 +78,10 @@
+ 	depends on GENERIC_ALLOCATOR
+ 	depends on PAGE_POOL
+ 
++config NET_CRC32C
++	bool
++	select CRC32
++
+ menu "Networking options"
+ 
+ source "net/packet/Kconfig"
+
+--- a/net/openvswitch/Kconfig	2026-11-05 11:01:06.173268000 +0800
++++ b/net/openvswitch/Kconfig	2026-11-05 11:01:06.173268000 +0800
+@@ -11,7 +11,7 @@
+ 				     (!NF_NAT || NF_NAT) && \
+ 				     (!NETFILTER_CONNCOUNT || NETFILTER_CONNCOUNT)))
+ 	depends on PSAMPLE || !PSAMPLE
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select MPLS
+ 	select NET_MPLS_GSO
+ 	select DST_CACHE
