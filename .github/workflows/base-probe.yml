@@ -271,8 +271,30 @@ jobs:
             echo "::error::tools/install 失败"; tail -30 "$WORK/tools.log"; exit 1; }
           make toolchain/install -j"$(nproc)" > "$WORK/tc.log" 2>&1 || {
             echo "::error::toolchain/install 失败"; tail -30 "$WORK/tc.log"; exit 1; }
+          # 端口给的 config-6.12 是片段，arm64 架构级符号不全（上一轮缺
+          # RODATA_FULL_DEFAULT_ENABLED）。内核 syncconfig 碰到 (NEW) 符号会去读 stdin，
+          # 非交互 CI 里这一步直接判失败，于是永远看不到驱动的真错误。这里用 OpenWrt
+          # 自带的 target/linux/oldconfig：让 kconfig 按默认值补全，并把差额回写进
+          # target/linux/rtl9617c/config-6.12（老规则会过滤掉自动推导符号）。
+          # 另外 oldconfig 模式不静音依赖告警，能顺便看到 unmet direct dependencies
+          # ——syncconfig 模式把它们藏掉了。
+          # yes 被 SIGPIPE 打死是 141，pipefail 会把 make 的成功盖成失败，这里只对它关掉。
+          set +o pipefail
+          yes "" | make target/linux/oldconfig > "$WORK/oldconfig.log" 2>&1 || {
+            echo "::error::target/linux/oldconfig 失败"; tail -40 "$WORK/oldconfig.log"; exit 1; }
+          set -o pipefail
+          echo "=== oldconfig 判定为 NEW 的符号 ==="
+          grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' "$WORK/oldconfig.log" \
+            | sed -E 's/\) \[.*//; s/^\(//' | sort -u | head -40 || true
+          echo "=== 依赖不满足（syncconfig 模式看不到，这里补上）==="
+          grep -A6 -iE "unmet (direct )?dependencies|WARNING: unmet" "$WORK/oldconfig.log" \
+            | head -60 || true
+          CFG12="target/linux/rtl9617c/config-${PROBE_KV:-$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' target/linux/rtl9617c/Makefile | head -1)}"
+          echo "=== 回写后的 $CFG12：$(grep -cE '^CONFIG_' "$CFG12" || true) 条 ==="
+          grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' "$CFG12" || true
+          cp "$CFG12" "$WORK/config-completed.log"
           for i in 1 2 3; do
-            if make target/compile -j"$(nproc)" > "$WORK/kernel-$i.log" 2>&1; then
+            if make target/compile -j"$(nproc)" </dev/null > "$WORK/kernel-$i.log" 2>&1; then
               echo "✅ 内核与驱动在 $PROBE_REF 上编过了（第 $i 次尝试）"
               break
             fi
@@ -286,7 +308,7 @@ jobs:
               # "ERROR: target/linux failed to build" 这一行 —— 上一轮就是这样
               # 拿不到原因的。单跑一次把真错误逼到 stdout。
               echo "=== 就地 -j1 V=s 重跑，拿真实编译错误 ==="
-              make target/compile -j1 V=s > "$WORK/kernel-verbose.log" 2>&1 || true
+              make target/compile -j1 V=s </dev/null > "$WORK/kernel-verbose.log" 2>&1 || true
               grep -nE 'error:|Error [0-9]|\*\*\*|No rule to make target|No such file' \
                 "$WORK/kernel-verbose.log" | tail -25 || true
               tail -40 "$WORK/kernel-verbose.log" || true
