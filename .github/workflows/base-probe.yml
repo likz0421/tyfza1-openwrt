@@ -274,29 +274,32 @@ jobs:
           # 端口给的 config-6.12 只是片段，arm64 架构级符号不全（上一轮缺的就是
           # RODATA_FULL_DEFAULT_ENABLED）。内核 syncconfig 碰到 (NEW) 符号会去读
           # stdin，非交互 CI 里直接判失败，于是永远看不到驱动的真错误。补全走两级：
-          # ①正规路 OpenWrt 的 target/linux/oldconfig，配 CONFIG_TARGET=env 让差额写进
-          #   env/kernel-config —— 它是 LINUX_KCONFIG_LIST 的最高优先级层，不会把我们
-          #   的 config-6.12 片段涂成一团。上一轮这条规则挂了，所以上 -j1 V=s 抓原因。
-          # ②兜底：第一遍编译若死在 kconfig 提问上，就拿 OpenWrt 已经灌进 build_dir 的
-          #   .config，用内核自己的 olddefconfig（该模式不提问、不读 stdin）按默认值补齐，
-          #   差额同样塞进 env/kernel-config，再编第二遍。
-          # oldconfig 还有个附带价值：它不像 syncconfig 那样 conf_set_message_callback(NULL)，
-          # 能看到被静音掉的 unmet direct dependencies。
+          # ①正规路 make kernel_oldconfig（toplevel.mk:164；上一轮用的
+          #   target/linux/oldconfig 在这棵树里根本不是 goal，直接 No rule to make
+          #   target），配 CONFIG_TARGET=env 让差额写进 env/kernel-config —— 它是
+          #   LINUX_KCONFIG_LIST 的最高优先级层，不会把我们的 config-6.12 片段涂成一团。
+          # ②兜底：编译第一遍挂了就用内核自带的 olddefconfig（该模式不提问、不读 stdin）
+          #   补齐差额，同样塞进 env/kernel-config，再编第二遍。注意触发条件不能看
+          #   stdout 里有没有 (NEW)——非 verbose 下提问被收进 logs/，上一轮就是这么
+          #   漏掉兜底的。
+          # kernel_oldconfig 顺带有个附带价值：它不像 syncconfig 那样
+          # conf_set_message_callback(NULL)，能看到被静音掉的 unmet direct dependencies。
           KV="${PROBE_KV:-$(sed -n 's/^KERNEL_PATCHVER:=\(.*\)$/\1/p' target/linux/rtl9617c/Makefile | head -1)}"
           set +o pipefail
-          yes "" | make target/linux/oldconfig CONFIG_TARGET=env -j1 V=s > "$WORK/oldconfig.log" 2>&1 \
-            || echo "::warning::target/linux/oldconfig 没跑成，稍后用内核 olddefconfig 兜底"
+          yes "" | make kernel_oldconfig V=s CONFIG_TARGET=env > "$WORK/oldconfig.log" 2>&1 \
+            || echo "::warning::kernel_oldconfig 没跑成，稍后用内核 olddefconfig 兜底"
           set -o pipefail
-          echo "=== oldconfig 判定为 NEW 的符号 ==="
+          echo "=== kernel_oldconfig 判定为 NEW 的符号 ==="
           grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' "$WORK/oldconfig.log" \
             | sed -E 's/\) \[.*//; s/^\(//' | sort -u | head -40 || true
           echo "=== 依赖不满足（syncconfig 模式看不到，这里补上）==="
           grep -A6 -iE "unmet (direct )?dependencies|WARNING: unmet" "$WORK/oldconfig.log" | head -60 || true
-          echo "=== oldconfig 自己的失败原因（-j1 V=s 全文在 oldconfig.log）==="
+          echo "=== kernel_oldconfig 自己的失败原因（全文在 oldconfig.log）==="
           grep -nE 'error:|Error [0-9]+$|\*\*\*|No such file|No rule to make target|Permission denied' \
             "$WORK/oldconfig.log" | head -30 || true
           if [ -s env/kernel-config ]; then
             echo "=== env/kernel-config 补了 $(grep -cE '^CONFIG_' env/kernel-config || true) 条 ==="
+            grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' env/kernel-config || true
             cp env/kernel-config "$WORK/env-kernel-config.log"
           fi
           # -k 让内核构建在第一个失败后继续，一次把所有出错目录都摊出来——
@@ -309,19 +312,24 @@ jobs:
             OKC=1
           else
             KSRC=$(ksrc)
-            if [ -n "$KSRC" ] && [ -f "$KSRC/.config" ] \
-               && grep -qE '\(NEW\)|auto\.conf\.cmd: No such file' "$ATTEMPT_LOG"; then
-              echo "=== 第一遍卡在 kconfig 提问：olddefconfig 补齐后重编 ==="
+            if [ -n "$KSRC" ] && [ -f "$KSRC/.config" ]; then
+              # 拿 OpenWrt 已灌进 $(LINUX_DIR)/.config 的那份，用内核 olddefconfig
+              # 补齐（不提问、不读 stdin），差额塞进 env/kernel-config 后重编。
+              echo "=== 第一遍没过：olddefconfig 补齐后重编 ==="
               cp "$KSRC/.config" "$WORK/config-before"
               if make -C "$KSRC" ARCH=arm64 olddefconfig </dev/null > "$WORK/olddefconfig.log" 2>&1; then
                 mkdir -p env
                 grep -vxF -f "$WORK/config-before" "$KSRC/.config" > "$WORK/env-kernel-config" || true
-                echo "  补进 env/kernel-config 共 $(grep -cE '^CONFIG_' "$WORK/env-kernel-config" || true) 条"
-                grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' "$WORK/env-kernel-config" || true
-                cat "$WORK/env-kernel-config" > env/kernel-config
-                cp env/kernel-config "$WORK/env-kernel-config.log"
-                ATTEMPT_LOG="$WORK/kernel-2.log"
-                make -k target/compile -j"$(nproc)" </dev/null > "$ATTEMPT_LOG" 2>&1 && OKC=1
+                if [ -s "$WORK/env-kernel-config" ]; then
+                  echo "  补进 env/kernel-config 共 $(grep -cE '^CONFIG_' "$WORK/env-kernel-config" || true) 条"
+                  grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' "$WORK/env-kernel-config" || true
+                  cat "$WORK/env-kernel-config" > env/kernel-config
+                  cp env/kernel-config "$WORK/env-kernel-config.log"
+                  ATTEMPT_LOG="$WORK/kernel-2.log"
+                  make -k target/compile -j"$(nproc)" </dev/null > "$ATTEMPT_LOG" 2>&1 && OKC=1
+                else
+                  echo "=== 差额为空：卡住的不是 (NEW) 符号，直接收集错误 ==="
+                fi
               else
                 echo "::warning::olddefconfig 兜底也失败，原因见 olddefconfig.log"
                 grep -nE 'error:|Error [0-9]+$|\*\*\*|No such file' "$WORK/olddefconfig.log" | head -20 || true
