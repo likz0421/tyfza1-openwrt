@@ -1,0 +1,423 @@
+Subject: [PATCH] crypto: crc32c: backport standalone CRC32C to 6.12
+
+6.12 wires CRC32C through the Crypto API: config LIBCRC32C selects
+CRYPTO and CRYPTO_CRC32C, and lib/libcrc32c.c implements crc32c() on
+top of a crypto shash.  That pulls CRYPTO into the dependency graph
+and closes a loop with the platform networking symbols:
+
+  LIBCRC32C -> CRYPTO -> CRYPTO_DEV_FSL_CAAM -> FSL_MC_BUS
+            -> FSL_DPAA2_ETH -> PHYLINK -> PHYLIB
+            -> RTL9617C_XRAM_ETH -> NETFILTER -> NF_TABLES
+            -> LIBCRC32C
+
+which makes syncconfig abort with "recursive dependency detected!".
+
+Upstream v6.18 already solved this: LIBCRC32C is gone, net/Kconfig
+gains "config NET_CRC32C / bool / select CRC32", the net side selects
+NET_CRC32C, and crc32c() is a plain library function with no Crypto API
+dependency.  This patch backports that shape onto 6.12:
+
+  * drop config LIBCRC32C and lib/libcrc32c.c;
+  * implement crc32c() on top of __crc32c_le() in lib/crc32.c, which
+    6.12 already provides (software fallback plus the ARM64 CRC32
+    extension assembly), so the result is bit-identical to the old
+    shash based helper;
+  * add config NET_CRC32C exactly as upstream v6.18 has it;
+  * point every remaining "select LIBCRC32C" at NET_CRC32C.
+
+Signed-off-by: likz0421 <likz0421@users.noreply.github.com>
+---
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -77,6 +77,10 @@
+ 	depends on DMA_SHARED_BUFFER=y
+ 	depends on GENERIC_ALLOCATOR
+ 	depends on PAGE_POOL
++
++config NET_CRC32C
++	bool
++	select CRC32
+ 
+ menu "Networking options"
+ 
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -257,17 +257,6 @@
+ 	  modules require CRC7 functions, but a module built outside
+ 	  the kernel tree does. Such modules that use library CRC7
+ 	  functions require M here.
+-
+-config LIBCRC32C
+-	tristate "CRC32c (Castagnoli, et al) Cyclic Redundancy-Check"
+-	select CRYPTO
+-	select CRYPTO_CRC32C
+-	help
+-	  This option is provided for the case where no in-kernel-tree
+-	  modules require CRC32c functions, but a module built outside the
+-	  kernel tree does. Such modules that use library CRC32c functions
+-	  require M here.  See Castagnoli93.
+-	  Module will be libcrc32c.
+ 
+ config CRC8
+ 	tristate "CRC8 function"
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -173,7 +173,6 @@
+ obj-$(CONFIG_CRC32_SELFTEST)	+= crc32test.o
+ obj-$(CONFIG_CRC4)	+= crc4.o
+ obj-$(CONFIG_CRC7)	+= crc7.o
+-obj-$(CONFIG_LIBCRC32C)	+= libcrc32c.o
+ obj-$(CONFIG_CRC8)	+= crc8.o
+ obj-$(CONFIG_CRC64_ROCKSOFT) += crc64-rocksoft.o
+ obj-$(CONFIG_XXHASH)	+= xxhash.o
+--- a/lib/libcrc32c.c
++++ /dev/null
+@@ -1,74 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
+-/* 
+- * CRC32C
+- *@Article{castagnoli-crc,
+- * author =       { Guy Castagnoli and Stefan Braeuer and Martin Herrman},
+- * title =        {{Optimization of Cyclic Redundancy-Check Codes with 24
+- *                 and 32 Parity Bits}},
+- * journal =      IEEE Transactions on Communication,
+- * year =         {1993},
+- * volume =       {41},
+- * number =       {6},
+- * pages =        {},
+- * month =        {June},
+- *}
+- * Used by the iSCSI driver, possibly others, and derived from
+- * the iscsi-crc.c module of the linux-iscsi driver at
+- * http://linux-iscsi.sourceforge.net.
+- *
+- * Following the example of lib/crc32, this function is intended to be
+- * flexible and useful for all users.  Modules that currently have their
+- * own crc32c, but hopefully may be able to use this one are:
+- *  net/sctp (please add all your doco to here if you change to
+- *            use this one!)
+- *  <endoflist>
+- *
+- * Copyright (c) 2004 Cisco Systems, Inc.
+- */
+-
+-#include <crypto/hash.h>
+-#include <linux/err.h>
+-#include <linux/init.h>
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/crc32c.h>
+-
+-static struct crypto_shash *tfm;
+-
+-u32 crc32c(u32 crc, const void *address, unsigned int length)
+-{
+-	SHASH_DESC_ON_STACK(shash, tfm);
+-	u32 ret, *ctx = (u32 *)shash_desc_ctx(shash);
+-	int err;
+-
+-	shash->tfm = tfm;
+-	*ctx = crc;
+-
+-	err = crypto_shash_update(shash, address, length);
+-	BUG_ON(err);
+-
+-	ret = *ctx;
+-	barrier_data(ctx);
+-	return ret;
+-}
+-
+-EXPORT_SYMBOL(crc32c);
+-
+-static int __init libcrc32c_mod_init(void)
+-{
+-	tfm = crypto_alloc_shash("crc32c", 0, 0);
+-	return PTR_ERR_OR_ZERO(tfm);
+-}
+-
+-static void __exit libcrc32c_mod_fini(void)
+-{
+-	crypto_free_shash(tfm);
+-}
+-
+-module_init(libcrc32c_mod_init);
+-module_exit(libcrc32c_mod_fini);
+-
+-MODULE_AUTHOR("Clay Haapala <chaapala@cisco.com>");
+-MODULE_DESCRIPTION("CRC32c (Castagnoli) calculations");
+-MODULE_LICENSE("GPL");
+-MODULE_SOFTDEP("pre: crc32c");
+--- a/lib/crc32.c
++++ b/lib/crc32.c
+@@ -27,6 +27,7 @@
+ /* see: Documentation/staging/crc32.rst for a description of algorithms */
+ 
+ #include <linux/crc32.h>
++#include <linux/crc32c.h>
+ #include <linux/crc32poly.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
+@@ -204,6 +205,25 @@
+ EXPORT_SYMBOL(crc32_le);
+ EXPORT_SYMBOL(__crc32c_le);
+ 
++/*
++ * crc32c() - Compute CRC-32C (Castagnoli)
++ *
++ * Thin wrapper around the architecture CRC32C implementation.  The old
++ * lib/libcrc32c.c helper routed this through the Crypto API shash, which
++ * made LIBCRC32C depend on CRYPTO and produced a Kconfig dependency loop
++ * (CRYPTO -> FSL_MC_BUS -> FSL_DPAA2_ETH -> PHYLINK -> PHYLIB ->
++ * RTL9617C_XRAM_ETH -> NETFILTER -> NF_TABLES -> LIBCRC32C -> CRYPTO).
++ *
++ * Upstream v6.18 solved this by making CRC32C a standalone library; this is
++ * the 6.12 equivalent - __crc32c_le() is already available from CRC32 (and
++ * is overridden by the ARM64 CRC32 extension assembly when present).
++ */
++u32 crc32c(u32 crc, const void *address, unsigned int length)
++{
++	return __crc32c_le(crc, address, length);
++}
++EXPORT_SYMBOL(crc32c);
++
+ u32 __pure crc32_le_base(u32, unsigned char const *, size_t) __alias(crc32_le);
+ u32 __pure __crc32c_le_base(u32, unsigned char const *, size_t) __alias(__crc32c_le);
+ u32 __pure crc32_be_base(u32, unsigned char const *, size_t) __alias(crc32_be);
+--- a/drivers/block/Kconfig
++++ b/drivers/block/Kconfig
+@@ -379,7 +379,7 @@
+ 	tristate "Rados block device (RBD)"
+ 	depends on INET && BLOCK
+ 	select CEPH_LIB
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select CRYPTO_AES
+ 	select CRYPTO
+ 	help
+--- a/drivers/block/drbd/Kconfig
++++ b/drivers/block/drbd/Kconfig
+@@ -10,7 +10,7 @@
+ 	tristate "DRBD Distributed Replicated Block Device support"
+ 	depends on PROC_FS && INET
+ 	select LRU_CACHE
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	help
+ 
+ 	  NOTE: In order to authenticate connections you have to select
+--- a/drivers/infiniband/sw/siw/Kconfig
++++ b/drivers/infiniband/sw/siw/Kconfig
+@@ -2,7 +2,7 @@
+ 	tristate "Software RDMA over TCP/IP (iWARP) driver"
+ 	depends on INET && INFINIBAND
+ 	depends on INFINIBAND_VIRT_DMA
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select CRYPTO
+ 	select CRYPTO_CRC32C
+ 	help
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -139,7 +139,7 @@
+ 	tristate "RAID-4/RAID-5/RAID-6 mode"
+ 	depends on BLK_DEV_MD
+ 	select RAID6_PQ
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select ASYNC_MEMCPY
+ 	select ASYNC_XOR
+ 	select ASYNC_PQ
+--- a/drivers/md/persistent-data/Kconfig
++++ b/drivers/md/persistent-data/Kconfig
+@@ -2,7 +2,7 @@
+ config DM_PERSISTENT_DATA
+        tristate
+        depends on BLK_DEV_DM
+-       select LIBCRC32C
++       select NET_CRC32C
+        select DM_BUFIO
+ 	help
+ 	 Library providing immutable on-disk data structure support for
+--- a/drivers/net/ethernet/broadcom/Kconfig
++++ b/drivers/net/ethernet/broadcom/Kconfig
+@@ -144,7 +144,7 @@
+ 	depends on PTP_1588_CLOCK_OPTIONAL
+ 	select FW_LOADER
+ 	select ZLIB_INFLATE
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select MDIO
+ 	help
+ 	  This driver supports Broadcom NetXtremeII 10 gigabit Ethernet cards.
+@@ -209,7 +209,7 @@
+ 	depends on PCI
+ 	depends on PTP_1588_CLOCK_OPTIONAL
+ 	select FW_LOADER
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select NET_DEVLINK
+ 	select PAGE_POOL
+ 	select DIMLIB
+--- a/drivers/net/ethernet/cavium/Kconfig
++++ b/drivers/net/ethernet/cavium/Kconfig
+@@ -71,7 +71,7 @@
+ 	depends on PCI
+ 	depends on PTP_1588_CLOCK_OPTIONAL
+ 	select FW_LOADER
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select LIQUIDIO_CORE
+ 	select NET_DEVLINK
+ 	help
+--- a/fs/bcachefs/Kconfig
++++ b/fs/bcachefs/Kconfig
+@@ -4,7 +4,7 @@
+ 	depends on BLOCK
+ 	select EXPORTFS
+ 	select CLOSURES
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select CRC64
+ 	select FS_POSIX_ACL
+ 	select LZ4_COMPRESS
+--- a/fs/btrfs/Kconfig
++++ b/fs/btrfs/Kconfig
+@@ -5,7 +5,7 @@
+ 	select BLK_CGROUP_PUNT_BIO
+ 	select CRYPTO
+ 	select CRYPTO_CRC32C
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select CRYPTO_XXHASH
+ 	select CRYPTO_SHA256
+ 	select CRYPTO_BLAKE2B
+--- a/fs/ceph/Kconfig
++++ b/fs/ceph/Kconfig
+@@ -3,7 +3,7 @@
+ 	tristate "Ceph distributed file system"
+ 	depends on INET
+ 	select CEPH_LIB
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select CRYPTO_AES
+ 	select CRYPTO
+ 	select NETFS_SUPPORT
+--- a/fs/erofs/Kconfig
++++ b/fs/erofs/Kconfig
+@@ -4,7 +4,7 @@
+ 	tristate "EROFS filesystem support"
+ 	depends on BLOCK
+ 	select FS_IOMAP
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	help
+ 	  EROFS (Enhanced Read-Only File System) is a lightweight read-only
+ 	  file system with modern designs (e.g. no buffer heads, inline
+--- a/fs/gfs2/Kconfig
++++ b/fs/gfs2/Kconfig
+@@ -4,7 +4,7 @@
+ 	select BUFFER_HEAD
+ 	select FS_POSIX_ACL
+ 	select CRC32
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select QUOTACTL
+ 	select FS_IOMAP
+ 	help
+--- a/fs/xfs/Kconfig
++++ b/fs/xfs/Kconfig
+@@ -3,7 +3,7 @@
+ 	tristate "XFS filesystem support"
+ 	depends on BLOCK
+ 	select EXPORTFS
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select FS_IOMAP
+ 	help
+ 	  XFS is a high performance journaling filesystem which originated
+--- a/net/batman-adv/Kconfig
++++ b/net/batman-adv/Kconfig
+@@ -9,7 +9,7 @@
+ 
+ config BATMAN_ADV
+ 	tristate "B.A.T.M.A.N. Advanced Meshing Protocol"
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	help
+ 	  B.A.T.M.A.N. (better approach to mobile ad-hoc networking) is
+ 	  a routing protocol for multi-hop ad-hoc mesh networks. The
+--- a/net/ceph/Kconfig
++++ b/net/ceph/Kconfig
+@@ -2,7 +2,7 @@
+ config CEPH_LIB
+ 	tristate "Ceph core library"
+ 	depends on INET
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select CRYPTO_AES
+ 	select CRYPTO_CBC
+ 	select CRYPTO_GCM
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -212,7 +212,7 @@
+ 	bool 'SCTP protocol connection tracking support'
+ 	depends on NETFILTER_ADVANCED
+ 	default y
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	help
+ 	  With this option enabled, the layer 3 independent connection
+ 	  tracking code will be able to do state tracking on SCTP connections.
+@@ -474,7 +474,7 @@
+ 
+ config NF_TABLES
+ 	select NETFILTER_NETLINK
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	tristate "Netfilter nf_tables support"
+ 	help
+ 	  nftables is the new packet classification framework that intends to
+--- a/net/netfilter/ipvs/Kconfig
++++ b/net/netfilter/ipvs/Kconfig
+@@ -105,7 +105,7 @@
+ 
+ config  IP_VS_PROTO_SCTP
+ 	bool "SCTP load balancing support"
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	help
+ 	  This option enables support for load balancing SCTP transport
+ 	  protocol. Say Y if unsure.
+--- a/net/openvswitch/Kconfig
++++ b/net/openvswitch/Kconfig
+@@ -11,7 +11,7 @@
+ 				     (!NF_NAT || NF_NAT) && \
+ 				     (!NETFILTER_CONNCOUNT || NETFILTER_CONNCOUNT)))
+ 	depends on PSAMPLE || !PSAMPLE
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select MPLS
+ 	select NET_MPLS_GSO
+ 	select DST_CACHE
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -784,7 +784,7 @@
+ config NET_ACT_CSUM
+ 	tristate "Checksum Updating"
+ 	depends on NET_CLS_ACT && INET
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	help
+ 	  Say Y here to update some common checksum after some direct
+ 	  packet alterations.
+--- a/net/sctp/Kconfig
++++ b/net/sctp/Kconfig
+@@ -10,7 +10,7 @@
+ 	select CRYPTO
+ 	select CRYPTO_HMAC
+ 	select CRYPTO_SHA1
+-	select LIBCRC32C
++	select NET_CRC32C
+ 	select NET_UDP_TUNNEL
+ 	help
+ 	  Stream Control Transmission Protocol
