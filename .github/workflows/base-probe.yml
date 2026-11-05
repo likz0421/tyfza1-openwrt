@@ -293,75 +293,92 @@ jobs:
           echo "=== 回写后的 $CFG12：$(grep -cE '^CONFIG_' "$CFG12" || true) 条 ==="
           grep -E '^CONFIG_(RODATA_FULL_DEFAULT_ENABLED|ARM64_4K_PAGES)=' "$CFG12" || true
           cp "$CFG12" "$WORK/config-completed.log"
-          for i in 1 2 3; do
-            if make target/compile -j"$(nproc)" </dev/null > "$WORK/kernel-$i.log" 2>&1; then
-              echo "✅ 内核与驱动在 $PROBE_REF 上编过了（第 $i 次尝试）"
-              break
+          # -k 让内核构建在第一个失败后继续跑，一次把所有出错目录都摊出来——
+          # 不带 -k 时 make 停在第一个失败处，每 40 分钟只能暴露一处驱动错误。
+          # 有了 -k，重试三次不会有任何新信息，所以只跑一轮。
+          ATTEMPT_LOG="$WORK/kernel-1.log"
+          if make -k target/compile -j"$(nproc)" </dev/null > "$ATTEMPT_LOG" 2>&1; then
+            echo "✅ 内核与驱动在 $PROBE_REF 上编过了"
+          else
+            # 并行不带 V=s 时真正的编译错误被收进 logs/，stdout 只剩
+            # "ERROR: target/linux failed to build" 这一行 —— 上一轮就是这样
+            # 拿不到原因的。把 logs/ 并进来才拿得全（8MB 上限防炸）。
+            ALLLOG="$ATTEMPT_LOG"
+            if [ -n "$(find logs -type f -print -quit 2>/dev/null || true)" ]; then
+              find logs -type f -exec cat {} + 2>/dev/null \
+                | tail -c 8000000 > "$WORK/kernel-1.logs.log" || true
+              cat "$ATTEMPT_LOG" "$WORK/kernel-1.logs.log" > "$WORK/kernel-combined.log" 2>/dev/null || true
+              ALLLOG="$WORK/kernel-combined.log"
             fi
-            echo "第 $i 次失败，抓 (NEW) 提问与真错误："
-            { cat "$WORK/kernel-$i.log"; find logs -type f -exec cat {} + 2>/dev/null | tail -c 300000; } \
-              | grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' | sed -E 's/\) \[.*//; s/^\(//' \
-              | sort -u | head -20 || true
-            grep -nE 'error:|Error [0-9]|\*\*\*|undefined reference|No rule' "$WORK/kernel-$i.log" | head -12 || true
-            if [ "$i" = 3 ]; then
-              # 并行不带 V=s 时真正的编译错误被收进 logs/，stdout 只剩
-              # "ERROR: target/linux failed to build" 这一行 —— 上一轮就是这样
-              # 拿不到原因的。单跑一次把真错误逼到 stdout。
-              echo "=== 就地 -j1 V=s 重跑，拿真实编译错误 ==="
+            echo "=== oldconfig 补完之后还剩哪些 (NEW) 提问 ==="
+            grep -oE '\(([A-Z][A-Z0-9_]*)\) \[[^]]*\] \(NEW\)' "$ALLLOG" \
+              | sed -E 's/\) \[.*//; s/^\(//' | sort -u | head -40 || true
+            echo "=== 出错文件排名（6.18 驱动面向 6.12 的断点就在这些文件里）==="
+            grep -oE '[A-Za-z0-9_./-]+\.(c|h):[0-9]+:[0-9]+: (error|warning):' "$ALLLOG" \
+              | sed -E 's/:[0-9]+:[0-9]+: (error|warning):$//' | sed 's|.*/||' \
+              | sort | uniq -c | sort -rn | head -30 || true
+            echo "=== 全部真实错误（去重，最多 120 条）==="
+            sed -E 's|/home/runner/work/tyfza1-openwrt/tyfza1-openwrt/work/sources/openwrt/||g' \
+              "$ALLLOG" | grep -E 'error:|Error [0-9]+$|undefined reference|No rule to make target' \
+              | sort -u | head -120 || true
+            if ! grep -qE 'error:' "$ALLLOG"; then
+              # 一条编译错误都没有＝根本没走到编译（例如又卡在 kconfig），
+              # 单跑一次 -j1 V=s 把原因逼到 stdout。
+              echo "=== 没见到编译错误，就地 -j1 V=s 重跑拿原因 ==="
               make target/compile -j1 V=s </dev/null > "$WORK/kernel-verbose.log" 2>&1 || true
               grep -nE 'error:|Error [0-9]|\*\*\*|No rule to make target|No such file' \
                 "$WORK/kernel-verbose.log" | tail -25 || true
               tail -40 "$WORK/kernel-verbose.log" || true
-              # 一轮拿全不兼容补丁清单：make 遇到第一个打不上的补丁就停，
-              # 逐个 dry-run 才能避免每 40 分钟只暴露一个。
-              TREE="$PWD"
-              : > "$WORK/dryrun.log"
-              # 必须只认 target 目录下真正编内核的那棵树；find 取第一个 linux-* 会
-              # 选中 toolchain-*/linux-6.12.112（只有头文件），那上面的 dry-run 全是假 INCOMPAT。
-              KSRC=$(find build_dir -maxdepth 7 -type d \
-                -path "*/target-*/linux-rtl9617c_generic/linux-$PROBE_KV.*" 2>/dev/null | head -1 || true)
-              if [ -n "$KSRC" ]; then
-                {
-                  echo "=== patches-$PROBE_KV 全量 dry-run 预检（内核源码 $KSRC）==="
-                  BAD=0
-                  for p in "$TREE/target/linux/rtl9617c/patches-$PROBE_KV"/*.patch; do
-                    [ -f "$p" ] || continue
-                    if (cd "$KSRC" && patch -p1 -R --dry-run --batch < "$p") >/dev/null 2>&1; then
-                      echo "  APPLIED   $(basename "$p")"
-                    elif (cd "$KSRC" && patch -p1 --dry-run --batch < "$p") >/dev/null 2>&1; then
-                      echo "  OK        $(basename "$p")"
-                    else
-                      echo "  INCOMPAT  $(basename "$p")"
-                      BAD=$((BAD + 1))
-                    fi
-                  done
-                  echo "  合计 $BAD 个补丁在 $PROBE_KV 上不兼容"
-                } 2>&1 | tee "$WORK/dryrun.log"
-              fi
-
-              # 探针契约：绿 = 拿到明确的迁移结论，不等于「编过了」。
-              # 仅在①做 6.18→6.12 这类试验性回移、②日志里有真实的补丁应用
-              # 失败证据时，把 INCOMPATIBLE 作为正式结论收下；证据全部从真实
-              # 日志与全量预检结果里提取，不许脚本凭空给答案。
-              # 真实编译错误、或端口原生内核系列下的失败，一律 exit 1 照实红。
-              BADPATCH=$(grep -oE 'Patch failed! +Please fix [^ ]+' \
-                "$WORK/kernel-verbose.log" | sed 's|.*/||; s/!$//' \
-                | sort -u | paste -sd, - || true)
-              BADN=$(grep -c '  INCOMPAT  ' "$WORK/dryrun.log" 2>/dev/null || true)
-              BADLIST=$(sed -n 's/^  INCOMPAT  //p' "$WORK/dryrun.log" 2>/dev/null \
-                | paste -sd, - || true)
-              if [ -n "$BADPATCH" ] && [ -n "${PROBE_KV:-}" ] \
-                 && [ "$PROBE_KV" != "${PORT_KERNEL_PATCHVER:-}" ]; then
-                echo "KERNEL_VERDICT=INCOMPATIBLE" >> "$GITHUB_ENV"
-                echo "KERNEL_BADPATCH=$BADPATCH" >> "$GITHUB_ENV"
-                echo "KERNEL_BADLIST=${BADLIST:-（预检未取到清单，见 dryrun.log）}" >> "$GITHUB_ENV"
-                echo "VERDICT: 官方 $PROBE_REF 不能直接承载 $PORT_KERNEL_PATCHVER 端口：$BADPATCH 打不上，全量预检共 ${BADN:-0} 个补丁不兼容"
-                echo "::warning::探针结论（非构建脚本故障）：$PORT_KERNEL_PATCHVER 端口内核补丁与 $PROBE_KV 基座不兼容"
-                break
-              fi
-              echo "::error::内核编不过，详见 kernel-verbose.log"; exit 1
             fi
-          done
+            # 一轮拿全不兼容补丁清单：make 遇到第一个打不上的补丁就停，
+            # 逐个 dry-run 才能避免每 40 分钟只暴露一个。
+            TREE="$PWD"
+            : > "$WORK/dryrun.log"
+            # 必须只认 target 目录下真正编内核的那棵树；find 取第一个 linux-* 会
+            # 选中 toolchain-*/linux-6.12.112（只有头文件），那上面的 dry-run 全是假 INCOMPAT。
+            KSRC=$(find build_dir -maxdepth 7 -type d \
+              -path "*/target-*/linux-rtl9617c_generic/linux-$PROBE_KV.*" 2>/dev/null | head -1 || true)
+            if [ -n "$KSRC" ]; then
+              {
+                echo "=== patches-$PROBE_KV 全量 dry-run 预检（内核源码 $KSRC）==="
+                BAD=0
+                for p in "$TREE/target/linux/rtl9617c/patches-$PROBE_KV"/*.patch; do
+                  [ -f "$p" ] || continue
+                  if (cd "$KSRC" && patch -p1 -R --dry-run --batch < "$p") >/dev/null 2>&1; then
+                    echo "  APPLIED   $(basename "$p")"
+                  elif (cd "$KSRC" && patch -p1 --dry-run --batch < "$p") >/dev/null 2>&1; then
+                    echo "  OK        $(basename "$p")"
+                  else
+                    echo "  INCOMPAT  $(basename "$p")"
+                    BAD=$((BAD + 1))
+                  fi
+                done
+                echo "  合计 $BAD 个补丁在 $PROBE_KV 上不兼容"
+              } 2>&1 | tee "$WORK/dryrun.log"
+            fi
+
+            # 探针契约：绿 = 拿到明确的迁移结论，不等于「编过了」。
+            # 仅在①做 6.18→6.12 这类试验性回移、②日志里有真实的补丁应用
+            # 失败证据时，把 INCOMPATIBLE 作为正式结论收下；证据全部从真实
+            # 日志与全量预检结果里提取，不许脚本凭空给答案。
+            # 真实编译错误、或端口原生内核系列下的失败，一律 exit 1 照实红。
+            BADPATCH=$(grep -hoE 'Patch failed! +Please fix [^ ]+' \
+              "$ALLLOG" "$WORK/kernel-verbose.log" 2>/dev/null | sed 's|.*/||; s/!$//' \
+              | sort -u | paste -sd, - || true)
+            BADN=$(grep -c '  INCOMPAT  ' "$WORK/dryrun.log" 2>/dev/null || true)
+            BADLIST=$(sed -n 's/^  INCOMPAT  //p' "$WORK/dryrun.log" 2>/dev/null \
+              | paste -sd, - || true)
+            if [ -n "$BADPATCH" ] && [ -n "${PROBE_KV:-}" ] \
+               && [ "$PROBE_KV" != "${PORT_KERNEL_PATCHVER:-}" ]; then
+              echo "KERNEL_VERDICT=INCOMPATIBLE" >> "$GITHUB_ENV"
+              echo "KERNEL_BADPATCH=$BADPATCH" >> "$GITHUB_ENV"
+              echo "KERNEL_BADLIST=${BADLIST:-（预检未取到清单，见 dryrun.log）}" >> "$GITHUB_ENV"
+              echo "VERDICT: 官方 $PROBE_REF 不能直接承载 $PORT_KERNEL_PATCHVER 端口：$BADPATCH 打不上，全量预检共 ${BADN:-0} 个补丁不兼容"
+              echo "::warning::探针结论（非构建脚本故障）：$PORT_KERNEL_PATCHVER 端口内核补丁与 $PROBE_KV 基座不兼容"
+            else
+              echo "::error::内核/驱动编不过，错误清单见 $ALLLOG"; exit 1
+            fi
+          fi
 
       - name: Upload probe logs
         if: always()
